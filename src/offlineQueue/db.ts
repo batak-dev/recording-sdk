@@ -309,6 +309,18 @@ export async function getCachedPresignedUrl(pathIdentifier: string, chunkIndex: 
   });
 }
 
+export async function deletePresignedUrl(pathIdentifier: string, chunkIndex: number): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.PRESIGNED_CACHE], 'readwrite');
+    const store = transaction.objectStore(STORES.PRESIGNED_CACHE);
+    const request = store.delete([pathIdentifier, chunkIndex]);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
 export async function cleanupExpiredPresignedUrls(): Promise<number> {
   const db = await getDB();
   const now = Date.now();
@@ -371,6 +383,47 @@ export async function clearAllData(): Promise<void> {
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
   });
+}
+
+/**
+ * Remove a single recording's transient data once it is fully uploaded and completed on the
+ * server: its chunks (and their stored blobs), presigned-URL cache entries, queued requests
+ * and metadata. The resilience event log is kept by default so the report / crash-recovery
+ * (`loadPersistedReport`) still works — pass `keepResilienceLog: false` to drop it too.
+ */
+export async function clearRecordingData(
+  pathIdentifier: string,
+  options: { keepResilienceLog?: boolean } = {}
+): Promise<void> {
+  const keepResilienceLog = options.keepResilienceLog ?? true;
+
+  // Chunks + their blobs + presigned-cache entries.
+  const chunks = await getChunksByPath(pathIdentifier);
+  const blobIds = chunks.map((c) => c.blobId).filter(Boolean) as string[];
+  if (blobIds.length > 0) {
+    const db = await getDB();
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction([STORES.BLOB_STORE], 'readwrite');
+      const store = transaction.objectStore(STORES.BLOB_STORE);
+      for (const id of blobIds) store.delete(id);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  }
+  for (const chunk of chunks) {
+    await deletePresignedUrl(pathIdentifier, chunk.chunkIndex);
+    await deleteChunk(pathIdentifier, chunk.chunkIndex);
+  }
+
+  // Queued requests belonging to this recording (path lives in request.data).
+  const requests = await getAllRequests();
+  for (const req of requests) {
+    if (req.data?.pathIdentifier === pathIdentifier) await deleteRequest(req.id);
+  }
+
+  // Metadata, and optionally the resilience log.
+  await deleteMetadata(pathIdentifier);
+  if (!keepResilienceLog) await deleteResilienceLog(pathIdentifier);
 }
 
 // ==================== Auth Token Cache Operations ====================

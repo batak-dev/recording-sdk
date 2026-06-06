@@ -40,10 +40,17 @@ export const STORE_NAMES = {
   RESILIENCE_LOG: 'resilienceLog'
 } as const;
 
-/** The default recording schema (identical to the original hardcoded v5 schema). */
+/**
+ * The default recording schema.
+ *
+ * v6 prunes the obsolete `pendingTimeline` store (per-question video splitting now uses the
+ * `questionOrder` carried in each chunk, so a separate timeline store is no longer needed).
+ * The pruning happens generically in {@link applySchema}: any object store present in the DB
+ * but absent from this descriptor is dropped during the version upgrade.
+ */
 export const DEFAULT_SCHEMA: SchemaDescriptor = {
   dbName: 'RecordingOfflineDB',
-  version: 5,
+  version: 6,
   stores: [
     {
       name: STORE_NAMES.REQUESTS,
@@ -94,10 +101,16 @@ export const DEFAULT_SCHEMA: SchemaDescriptor = {
 };
 
 /**
- * Create any object stores/indexes from the descriptor that don't already exist.
- * Safe to call from `onupgradeneeded` on both the main thread and the service worker.
+ * Reconcile the database to the descriptor: create any missing stores/indexes, and drop any
+ * object store that is no longer part of the schema (e.g. the legacy `pendingTimeline` store).
+ * The descriptor is the single source of truth. Safe to call from `onupgradeneeded` on both the
+ * main thread and the service worker. Bump `SchemaDescriptor.version` whenever you add or remove
+ * a store so this runs against existing databases.
  */
 export function applySchema(db: IDBDatabase, schema: SchemaDescriptor): void {
+  const wanted = new Set(schema.stores.map((s) => s.name));
+
+  // Create missing stores (+ their indexes).
   for (const store of schema.stores) {
     if (db.objectStoreNames.contains(store.name)) continue;
     const objectStore = db.createObjectStore(store.name, {
@@ -107,5 +120,10 @@ export function applySchema(db: IDBDatabase, schema: SchemaDescriptor): void {
     for (const index of store.indexes ?? []) {
       objectStore.createIndex(index.name, index.keyPath as string | string[], index.options);
     }
+  }
+
+  // Drop obsolete stores no longer in the descriptor.
+  for (const name of Array.from(db.objectStoreNames as unknown as ArrayLike<string>)) {
+    if (!wanted.has(name)) db.deleteObjectStore(name);
   }
 }

@@ -140,6 +140,22 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
     }
   }
 
+  // When a chunk is permanently FAILED, fail its chunk-driven requests too. The retry loop
+  // skips PRESIGNED_URL/UPLOAD_CHUNK requests (the chunk loop owns them), so leaving them
+  // PENDING would otherwise keep `remaining` > 0 forever and block COMPLETE_RECORDING's deps.
+  async function markChunkRequestsFailed(chunk: StoredChunk, error: string): Promise<void> {
+    for (const id of [chunk.uploadRequestId, chunk.presignedRequestId]) {
+      if (!id) continue;
+      const req = await db.getRequest(id);
+      if (req && req.status !== 'COMPLETED' && req.status !== 'FAILED') {
+        req.status = 'FAILED';
+        req.error = error;
+        req.updatedAt = Date.now();
+        await db.updateRequest(req);
+      }
+    }
+  }
+
   // ---- Chunk processing --------------------------------------------------------------
 
   async function processChunk(chunk: StoredChunk): Promise<void> {
@@ -236,102 +252,152 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
 
   // ---- Retry orchestration -----------------------------------------------------------
 
+  const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  /**
+   * (Re)arm a one-shot Background Sync so a *closed* page still drains later. This is the
+   * only event that wakes a terminated worker on reconnect, so we re-arm it whenever work
+   * is left behind (deferred to a client, or still pending after a pass).
+   */
+  async function armBackgroundSync(): Promise<void> {
+    try {
+      await (sw.registration as any)?.sync?.register('retry-queue');
+    } catch {
+      // Background Sync unavailable — the online/fetch handlers remain as best-effort fallbacks.
+    }
+  }
+
   let retrying = false;
 
-  async function retryPendingOperations(): Promise<void> {
-    if (!isOnline()) return;
-    if (retrying) return;
+  /**
+   * One pass over every PENDING chunk, then every PENDING request. Chunk uploads are driven
+   * here (processChunk also marks their PRESIGNED_URL/UPLOAD_CHUNK requests COMPLETED), so the
+   * request loop skips those types rather than mis-handling them as "unsupported".
+   * Returns how many ops it advanced and how many remain PENDING.
+   */
+  async function drainOnce(): Promise<{ progressed: number; remaining: number }> {
+    let progressed = 0;
+
+    for (const chunk of await db.getChunksByStatus('PENDING')) {
+      if (!isOnline()) break;
+      const fresh = await db.getChunk(chunk.pathIdentifier, chunk.chunkIndex);
+      if (!fresh || fresh.status !== 'PENDING') continue;
+      fresh.status = 'IN_PROGRESS';
+      await db.updateChunk(fresh);
+      try {
+        await processChunk(fresh);
+        progressed++;
+        await notifyClients({
+          type: 'CHUNK_UPLOADED',
+          chunkIndex: chunk.chunkIndex,
+          pathIdentifier: chunk.pathIdentifier
+        });
+      } catch (error) {
+        const reload = await db.getChunk(chunk.pathIdentifier, chunk.chunkIndex);
+        if (reload) {
+          if (!isNetworkError(error)) reload.attempts++;
+          reload.status = reload.attempts >= maxChunkAttempts ? 'FAILED' : 'PENDING';
+          await db.updateChunk(reload);
+          if (reload.status === 'FAILED') {
+            await markChunkRequestsFailed(reload, String((error as any)?.message ?? error));
+          }
+        }
+      }
+    }
+
+    const requests = (await db.getRequestsByStatus('PENDING')).sort((a, b) => {
+      const pa = a.priority ?? getRequestPriority(a.type);
+      const pb = b.priority ?? getRequestPriority(b.type);
+      return pa !== pb ? pa - pb : a.createdAt - b.createdAt;
+    });
+    for (const request of requests) {
+      if (!isOnline()) break;
+      // PRESIGNED_URL/UPLOAD_CHUNK are chunk-driven (see the chunk loop above).
+      if (request.type === 'PRESIGNED_URL' || request.type === 'UPLOAD_CHUNK') continue;
+      const fresh = await db.getRequest(request.id);
+      if (!fresh || fresh.status !== 'PENDING') continue;
+      if (!(await checkDependencies(fresh))) continue;
+      try {
+        await processRequest(fresh);
+        progressed++;
+        await notifyClients({ type: 'REQUEST_COMPLETED', requestId: request.id, requestType: request.type });
+        // Once the recording is completed on the server, purge its now-redundant queue data
+        // (chunks/blobs/requests/metadata); the resilience log is kept for the report.
+        if (fresh.type === 'COMPLETE_RECORDING' && fresh.data?.pathIdentifier) {
+          await db.clearRecordingData(fresh.data.pathIdentifier, { keepResilienceLog: true });
+        }
+      } catch (error: any) {
+        const reload = await db.getRequest(request.id);
+        if (reload) {
+          if (!isNetworkError(error)) reload.attempts++;
+          if (error.message === 'AUTH_TOKEN_UNAVAILABLE' || error.message === 'AUTH_TOKEN_EXPIRED') {
+            reload.status = 'NEEDS_AUTH';
+          } else if (reload.attempts >= reload.maxAttempts) {
+            reload.status = 'FAILED';
+            reload.error = error.message;
+          } else {
+            reload.status = 'PENDING';
+          }
+          reload.updatedAt = Date.now();
+          await db.updateRequest(reload);
+        }
+      }
+    }
+
+    const remaining =
+      (await db.getChunksByStatus('PENDING')).length + (await db.getRequestsByStatus('PENDING')).length;
+    return { progressed, remaining };
+  }
+
+  /**
+   * Drain the queue to completion (or until no further progress) *within the caller's event
+   * lifetime* — never via a post-event timer, which a terminated worker would never run.
+   * Returns the number of still-PENDING operations: callers fired from the `sync` event reject
+   * when this is > 0 so the browser re-fires the sync (durable, survives worker termination).
+   *
+   * Returns -1 when it did not run to completion (offline, already running, or deferred to an
+   * open page) — the caller should not treat that as "queue drained".
+   */
+  async function runRetryQueue(): Promise<number> {
+    if (!isOnline() || retrying) return -1;
     retrying = true;
     try {
-      // Defer to the page when it's open and driving the queue.
-      const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: false });
+      // Defer to the page when it's open and driving the queue (avoids double-processing),
+      // but re-arm a background sync so the worker still takes over once the page closes.
+      // includeUncontrolled: a freshly-loaded page runs its OfflineQueueManager even before
+      // the worker claims it, so treat any open window of this origin as "the page has it".
+      const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
       if (clients.length > 0) {
-        await notifyClients({ type: 'SW_READY', message: 'Service Worker ready but deferring' });
-        return;
+        await notifyClients({ type: 'SW_READY', message: 'Service Worker deferring to open client' });
+        await armBackgroundSync();
+        return -1;
       }
 
-      const chunks = (await db.getAllChunks()).filter((c) => c.status === 'PENDING');
-      const requests = (await db.getAllRequests()).filter((r) => r.status === 'PENDING');
-      if (chunks.length === 0 && requests.length === 0) return;
-
-      let chunkSuccess = 0;
-      let chunkFail = 0;
-      for (const chunk of chunks) {
-        const fresh = await db.getChunk(chunk.pathIdentifier, chunk.chunkIndex);
-        if (!fresh || fresh.status !== 'PENDING') continue;
-        fresh.status = 'IN_PROGRESS';
-        await db.updateChunk(fresh);
-        try {
-          await processChunk(fresh);
-          chunkSuccess++;
-          await notifyClients({
-            type: 'CHUNK_UPLOADED',
-            chunkIndex: chunk.chunkIndex,
-            pathIdentifier: chunk.pathIdentifier
-          });
-        } catch (error) {
-          chunkFail++;
-          const reload = await db.getChunk(chunk.pathIdentifier, chunk.chunkIndex);
-          if (reload) {
-            if (!isNetworkError(error)) reload.attempts++;
-            reload.status = reload.attempts >= maxChunkAttempts ? 'FAILED' : 'PENDING';
-            await db.updateChunk(reload);
-          }
-        }
-      }
-
-      requests.sort((a, b) => {
-        const pa = a.priority ?? getRequestPriority(a.type);
-        const pb = b.priority ?? getRequestPriority(b.type);
-        return pa !== pb ? pa - pb : a.createdAt - b.createdAt;
-      });
-
-      let reqSuccess = 0;
-      let reqFail = 0;
-      for (const request of requests) {
-        const fresh = await db.getRequest(request.id);
-        if (!fresh || fresh.status !== 'PENDING') continue;
-        if (!(await checkDependencies(fresh))) continue;
-        try {
-          await processRequest(fresh);
-          reqSuccess++;
-          await notifyClients({ type: 'REQUEST_COMPLETED', requestId: request.id, requestType: request.type });
-        } catch (error: any) {
-          reqFail++;
-          const reload = await db.getRequest(request.id);
-          if (reload) {
-            if (!isNetworkError(error)) reload.attempts++;
-            if (error.message === 'AUTH_TOKEN_UNAVAILABLE' || error.message === 'AUTH_TOKEN_EXPIRED') {
-              reload.status = 'NEEDS_AUTH';
-            } else if (reload.attempts >= reload.maxAttempts) {
-              reload.status = 'FAILED';
-              reload.error = error.message;
-            } else {
-              reload.status = 'PENDING';
-            }
-            reload.updatedAt = Date.now();
-            await db.updateRequest(reload);
-          }
-        }
+      let totalProgressed = 0;
+      let remaining = 0;
+      const maxPasses = 8;
+      for (let pass = 0; pass < maxPasses; pass++) {
+        const result = await drainOnce();
+        totalProgressed += result.progressed;
+        remaining = result.remaining;
+        if (remaining === 0) break;
+        if (result.progressed === 0) break; // no progress this pass — let Background Sync retry later
+        if (!isOnline()) break;
+        await delay(autoRetryIntervalMs);
       }
 
       await notifyClients({
         type: 'SYNC_COMPLETE',
-        chunkSuccessCount: chunkSuccess,
-        chunkFailCount: chunkFail,
-        requestSuccessCount: reqSuccess,
-        requestFailCount: reqFail
+        successCount: totalProgressed,
+        chunkSuccessCount: totalProgressed,
+        requestSuccessCount: totalProgressed,
+        remaining
       });
 
-      const remainingChunks = await db.getChunksByStatus('PENDING');
-      const remainingRequests = await db.getRequestsByStatus('PENDING');
-      if ((remainingChunks.length > 0 || remainingRequests.length > 0) && isOnline()) {
-        setTimeout(() => {
-          retryPendingOperations().catch((e) => console.error('[SW] Scheduled retry failed:', e));
-        }, autoRetryIntervalMs);
-      }
+      return remaining;
     } catch (error) {
       console.error('[SW] Error during retry:', error);
+      return -1;
     } finally {
       retrying = false;
     }
@@ -346,26 +412,40 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
   sw.addEventListener('activate', (event: any) => {
     event.waitUntil(
       sw.clients.claim().then(async () => {
-        if (!isOnline()) return;
-        const pendingChunks = await db.getChunksByStatus('PENDING');
-        const pendingRequests = await db.getRequestsByStatus('PENDING');
-        if (pendingChunks.length > 0 || pendingRequests.length > 0) {
-          setTimeout(() => {
-            retryPendingOperations().catch((e) => console.error('[SW] Auto-retry failed on activation:', e));
-          }, 1000);
-        }
+        const remaining = await runRetryQueue();
+        // Arm Background Sync so the queue still drains after the worker is terminated,
+        // whether work is left over (remaining > 0) or we deferred/were offline (-1).
+        if (remaining !== 0) await armBackgroundSync();
       })
     );
   });
 
   sw.addEventListener('sync', (event: any) => {
-    if (event.tag === 'retry-queue') {
-      event.waitUntil(retryPendingOperations());
-    }
+    if (event.tag !== 'retry-queue') return;
+    event.waitUntil(
+      (async () => {
+        const remaining = await runRetryQueue();
+        if (remaining > 0) {
+          // Real work still pending after draining: reject so the browser re-fires the sync
+          // (with its own backoff). Durable across worker termination, unlike an in-worker timer.
+          throw new Error(`retry-queue: work remaining (${remaining})`);
+        }
+        if (remaining < 0) {
+          // Deferred to an open page / offline / busy — resolve this firing but keep a fresh
+          // sync armed (resets backoff) so we still take over once the page closes / reconnects.
+          await armBackgroundSync();
+        }
+        // remaining === 0: queue fully drained — let the sync settle.
+      })()
+    );
   });
 
+  // Best-effort extra trigger; unreliable for a terminated worker, so Background Sync above
+  // remains the source of truth for the closed-page reconnect path.
   sw.addEventListener('online' as any, () => {
-    retryPendingOperations().catch((e) => console.error('[SW] Retry failed after coming online:', e));
+    runRetryQueue()
+      .then((remaining) => (remaining !== 0 ? armBackgroundSync() : undefined))
+      .catch((e) => console.error('[SW] Retry failed after coming online:', e));
   });
 
   let lastNetworkCheck = 0;
@@ -379,7 +459,8 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
         const pendingChunks = await db.getChunksByStatus('PENDING');
         const pendingRequests = await db.getRequestsByStatus('PENDING');
         if (pendingChunks.length > 0 || pendingRequests.length > 0) {
-          await retryPendingOperations();
+          const remaining = await runRetryQueue();
+          if (remaining !== 0) await armBackgroundSync();
         }
       })().catch(() => {})
     );
@@ -391,8 +472,11 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
       if (data.recordingServiceUrl) recordingServiceUrl = data.recordingServiceUrl;
       event.ports?.[0]?.postMessage({ success: true });
     } else if (data.type === 'TRIGGER_SYNC') {
-      retryPendingOperations()
-        .then(() => event.ports?.[0]?.postMessage({ success: true }))
+      runRetryQueue()
+        .then((remaining) => {
+          if (remaining !== 0) armBackgroundSync();
+          event.ports?.[0]?.postMessage({ success: true });
+        })
         .catch((error) => event.ports?.[0]?.postMessage({ success: false, error: error.message }));
     }
   });
