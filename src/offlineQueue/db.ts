@@ -11,20 +11,28 @@ import type {
   AuthTokenCache
 } from './types';
 import type { ResilienceEvent, ResilienceSessionMeta } from '../resilience/types';
+import {
+  DEFAULT_SCHEMA,
+  applySchema,
+  STORE_NAMES,
+  type SchemaDescriptor
+} from '../storage/schema';
 
-const DB_NAME = 'RecordingOfflineDB';
-const DB_VERSION = 5;
+// Active schema. Override via setRecordingDbSchema() before the first getDB() call to
+// add custom stores/indexes or bump the version. Extend DEFAULT_SCHEMA to keep the
+// built-in recording stores working.
+let activeSchema: SchemaDescriptor = DEFAULT_SCHEMA;
 
-// Store names
-export const STORES = {
-  REQUESTS: 'pendingRequests',
-  CHUNKS: 'pendingChunks',
-  METADATA: 'recordingMetadata',
-  PRESIGNED_CACHE: 'presignedUrlCache',
-  BLOB_STORE: 'blobStore',
-  AUTH_TOKEN_CACHE: 'authTokenCache',
-  RESILIENCE_LOG: 'resilienceLog'
-};
+export function setRecordingDbSchema(schema: SchemaDescriptor): void {
+  activeSchema = schema;
+}
+
+export function getRecordingDbSchema(): SchemaDescriptor {
+  return activeSchema;
+}
+
+// Store names (re-exported for the built-in CRUD operations and the service worker).
+export const STORES = STORE_NAMES;
 
 // Crash-safe snapshot of a recording's resilience event log.
 export interface ResilienceLogRecord {
@@ -57,59 +65,15 @@ async function registerBackgroundSync(): Promise<void> {
  */
 export async function getDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    const request = indexedDB.open(activeSchema.dbName, activeSchema.version);
 
     request.onerror = () => reject(request.error);
     request.onsuccess = () => resolve(request.result);
 
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
-
-      // Pending requests store
-      if (!db.objectStoreNames.contains(STORES.REQUESTS)) {
-        const requestStore = db.createObjectStore(STORES.REQUESTS, { keyPath: 'id' });
-        requestStore.createIndex('status', 'status', { unique: false });
-        requestStore.createIndex('priority', 'priority', { unique: false });
-        requestStore.createIndex('createdAt', 'createdAt', { unique: false });
-      }
-
-      // Pending chunks store
-      if (!db.objectStoreNames.contains(STORES.CHUNKS)) {
-        const chunkStore = db.createObjectStore(STORES.CHUNKS, { keyPath: ['pathIdentifier', 'chunkIndex'] });
-        chunkStore.createIndex('status', 'status', { unique: false });
-        chunkStore.createIndex('pathIdentifier', 'pathIdentifier', { unique: false });
-      }
-
-      // Recording metadata store
-      if (!db.objectStoreNames.contains(STORES.METADATA)) {
-        const metadataStore = db.createObjectStore(STORES.METADATA, { keyPath: 'pathIdentifier' });
-        metadataStore.createIndex('status', 'status', { unique: false });
-      }
-
-      // Presigned URL cache store
-      if (!db.objectStoreNames.contains(STORES.PRESIGNED_CACHE)) {
-        const cacheStore = db.createObjectStore(STORES.PRESIGNED_CACHE, { keyPath: ['pathIdentifier', 'chunkIndex'] });
-        cacheStore.createIndex('expiresAt', 'expiresAt', { unique: false });
-      }
-
-      // Blob store
-      if (!db.objectStoreNames.contains(STORES.BLOB_STORE)) {
-        const blobStore = db.createObjectStore(STORES.BLOB_STORE, { keyPath: 'id' });
-        blobStore.createIndex('createdAt', 'createdAt', { unique: false });
-      }
-
-      // Auth token cache store (for Service Worker access)
-      if (!db.objectStoreNames.contains(STORES.AUTH_TOKEN_CACHE)) {
-        const authTokenStore = db.createObjectStore(STORES.AUTH_TOKEN_CACHE, { keyPath: 'userId' });
-        authTokenStore.createIndex('sessionId', 'sessionId', { unique: false });
-        authTokenStore.createIndex('expiresAt', 'expiresAt', { unique: false });
-      }
-
-      // Resilience measurement log store (one record per recording, crash-safe)
-      if (!db.objectStoreNames.contains(STORES.RESILIENCE_LOG)) {
-        const resilienceStore = db.createObjectStore(STORES.RESILIENCE_LOG, { keyPath: 'pathIdentifier' });
-        resilienceStore.createIndex('updatedAt', 'updatedAt', { unique: false });
-      }
+      // Build stores/indexes from the (possibly customized) schema descriptor.
+      applySchema(db, activeSchema);
     };
   });
 }

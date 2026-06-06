@@ -2,8 +2,9 @@ import { ImageSegmenter } from '@mediapipe/tasks-vision';
 import { ChunkMuxer } from './muxer';
 import { initializeSegmenter, applyBackgroundEffect } from './segmentation';
 import { CODEC_PRESETS } from './config';
-import { NetworkMonitor, type NetworkStats, type NetworkQuality } from './networkMonitor';
-import { getQualityPreset, type QualityPreset } from './qualityLevels';
+import { NetworkMonitor, type NetworkStats, type NetworkQuality, type INetworkMonitor } from './networkMonitor';
+import { DefaultQualityStrategy, type IQualityStrategy } from './qualityStrategy';
+import { type QualityPreset } from './qualityLevels';
 import type { RecorderOptions, RecordingChunk, VideoConfig, AudioConfig, RecorderCodecConfig } from './types';
 
 const DEFAULT_VIDEO_CONFIG: VideoConfig = {
@@ -33,7 +34,8 @@ export class VideoRecorder {
   private onError?: (error: Error) => void;
   private onQualityChange?: (quality: string, bitrate: number) => void;
   private codec: RecorderCodecConfig;
-  private networkMonitor: NetworkMonitor | null = null;
+  private networkMonitor: INetworkMonitor | null = null;
+  private qualityStrategy: IQualityStrategy;
   private currentQuality: NetworkQuality = 'excellent';
   private currentQualityPreset: QualityPreset;
   private enableAdaptiveQuality: boolean;
@@ -69,15 +71,19 @@ export class VideoRecorder {
 
     const codecKey = options.codecKey ?? 'av1_opus';
     this.codec = CODEC_PRESETS[codecKey];
-    
+
+    // Quality strategy: maps throughput->quality and quality->preset. Injectable so a
+    // consumer can redefine "network quality" (custom thresholds and/or presets).
+    this.qualityStrategy = options.qualityStrategy ?? new DefaultQualityStrategy();
+
     // Set initial quality based on adaptive mode
     if (this.enableAdaptiveQuality) {
       this.currentQuality = 'excellent';
-      this.currentQualityPreset = getQualityPreset('excellent');
+      this.currentQualityPreset = this.qualityStrategy.getPreset('excellent');
     } else {
       const fixedQuality = options.fixedQuality ?? 'excellent';
       this.currentQuality = fixedQuality;
-      this.currentQualityPreset = getQualityPreset(fixedQuality);
+      this.currentQualityPreset = this.qualityStrategy.getPreset(fixedQuality);
     }
     
     this.muxer = new ChunkMuxer(
@@ -90,16 +96,25 @@ export class VideoRecorder {
     );
     this.muxer.setQuestionOrder(this.currentQuestionOrder);
     
-    // Initialize network monitor if adaptive quality is enabled
+    // Initialize network monitor if adaptive quality is enabled. The monitor can be
+    // fully replaced via `createNetworkMonitor`; otherwise the bundled NetworkMonitor is
+    // used. Either way it shares this recorder's quality strategy.
     if (this.enableAdaptiveQuality) {
-      this.networkMonitor = new NetworkMonitor(
-        (stats) => this.handleQualityChange(stats),
-        {
-          onMeasurement: this.onNetworkSample,
-          probeUrl: this.probeUrl,
-          forceProbe: this.forceProbe
-        }
-      );
+      const monitorOptions = {
+        onQualityChange: (stats: NetworkStats) => this.handleQualityChange(stats),
+        onMeasurement: this.onNetworkSample,
+        probeUrl: this.probeUrl,
+        forceProbe: this.forceProbe,
+        qualityStrategy: this.qualityStrategy
+      };
+      this.networkMonitor = options.createNetworkMonitor
+        ? options.createNetworkMonitor(monitorOptions)
+        : new NetworkMonitor(monitorOptions.onQualityChange, {
+            onMeasurement: monitorOptions.onMeasurement,
+            probeUrl: monitorOptions.probeUrl,
+            forceProbe: monitorOptions.forceProbe,
+            qualityStrategy: monitorOptions.qualityStrategy
+          });
     }
   }
   
@@ -424,8 +439,8 @@ export class VideoRecorder {
       return;
     }
     
-    this.currentQualityPreset = getQualityPreset(newQuality);
-    
+    this.currentQualityPreset = this.qualityStrategy.getPreset(newQuality);
+
     // Reconfigure encoders with new bitrates
     // Note: Encoder reconfiguration during recording can cause brief quality artifacts
     try {

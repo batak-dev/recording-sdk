@@ -45,4 +45,13 @@ export interface RecorderOptions {
   onNetworkSample?: (stats: import('./networkMonitor').NetworkStats) => void; // every monitor measurement
   probeUrl?: string; // base URL for the real upload-throughput probe endpoint
   forceProbe?: boolean; // use the upload probe even when the Network Information API is available
+  // Extensibility seams (optional; bundled defaults are used when omitted)
+  qualityStrategy?: import('./qualityStrategy').IQualityStrategy; // redefine throughput->quality + presets
+  createNetworkMonitor?: (options: {
+    onQualityChange: (stats: import('./networkMonitor').NetworkStats) => void;
+    onMeasurement?: (stats: import('./networkMonitor').NetworkStats) => void;
+    probeUrl?: string;
+    forceProbe?: boolean;
+    qualityStrategy: import('./qualityStrategy').IQualityStrategy;
+  }) => import('./networkMonitor').INetworkMonitor; // plug in a fully custom monitor
 }

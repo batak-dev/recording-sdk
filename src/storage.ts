@@ -7,3 +7,4 @@
  */
 export * from './offlineQueue/db';
 export * from './offlineQueue/blobStorage';
+export * from './storage/schema';

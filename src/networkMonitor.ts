@@ -1,3 +1,5 @@
+import { DefaultQualityStrategy, type IQualityStrategy } from './qualityStrategy';
+
 export type NetworkQuality = 'excellent' | 'good' | 'fair' | 'poor' | 'offline';
 
 export interface NetworkStats {
@@ -12,9 +14,22 @@ export interface NetworkMonitorOptions {
   onMeasurement?: (stats: NetworkStats) => void; // fires on EVERY measurement (resilience time-series)
   probeUrl?: string;     // base URL of the recording-service for the real upload probe
   forceProbe?: boolean;  // always probe, even if the Network Information API reports downlink
+  qualityStrategy?: IQualityStrategy; // custom throughput->quality classification (default: DefaultQualityStrategy)
 }
 
-export class NetworkMonitor {
+/**
+ * Minimal contract the recorder depends on. Implement this to plug in a fully custom
+ * network monitor (e.g. WebRTC stats, server-reported bandwidth) via the recorder's
+ * `createNetworkMonitor` option.
+ */
+export interface INetworkMonitor {
+  start(intervalMs?: number): Promise<void> | void;
+  stop(): void;
+  getCurrentQuality(): NetworkQuality;
+  getCurrentStats(): NetworkStats;
+}
+
+export class NetworkMonitor implements INetworkMonitor {
   private measurements: number[] = [];
   private maxMeasurements = 10; // Keep last 10 measurements
   private testInterval: number | null = null;
@@ -22,6 +37,7 @@ export class NetworkMonitor {
   private onMeasurement?: (stats: NetworkStats) => void;
   private probeUrl?: string;
   private forceProbe: boolean;
+  private qualityStrategy: IQualityStrategy;
   private currentQuality: NetworkQuality = 'excellent';
   private isMonitoring = false;
   private testChunkSize = 50000; // 50KB test chunks
@@ -34,6 +50,7 @@ export class NetworkMonitor {
     this.onMeasurement = options.onMeasurement;
     this.probeUrl = options.probeUrl;
     this.forceProbe = options.forceProbe ?? false;
+    this.qualityStrategy = options.qualityStrategy ?? new DefaultQualityStrategy();
     this.setupOnlineOfflineListeners();
   }
 
@@ -220,16 +237,8 @@ export class NetworkMonitor {
   }
 
   private determineQuality(throughputKbps: number): NetworkQuality {
-    // Quality thresholds based on video bitrate requirements
-    // Excellent: > 3 Mbps (can handle high quality)
-    // Good: 1.5 - 3 Mbps (can handle medium quality)
-    // Fair: 500 Kbps - 1.5 Mbps (need compression)
-    // Poor: < 500 Kbps (aggressive compression)
-    
-    if (throughputKbps >= 3000) return 'excellent';
-    if (throughputKbps >= 1500) return 'good';
-    if (throughputKbps >= 500) return 'fair';
-    return 'poor';
+    // Delegate to the injected strategy (default mirrors the original thresholds).
+    return this.qualityStrategy.classify(throughputKbps);
   }
 
   getCurrentQuality(): NetworkQuality {
