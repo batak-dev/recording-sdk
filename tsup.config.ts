@@ -8,7 +8,8 @@ export default defineConfig({
     network: 'src/network.ts',
     resilience: 'src/resilience.ts',
     transport: 'src/transport.ts',
-    auth: 'src/auth.ts'
+    auth: 'src/auth.ts',
+    sw: 'src/sw.ts'
   },
   format: ['esm'],
   dts: true,

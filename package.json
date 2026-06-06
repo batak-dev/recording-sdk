@@ -49,11 +49,20 @@
       "types": "./dist/auth.d.ts",
       "import": "./dist/auth.js"
     },
+    "./sw": {
+      "types": "./dist/sw.d.ts",
+      "import": "./dist/sw.js"
+    },
+    "./sw/worker": {
+      "types": "./dist/worker.d.ts",
+      "import": "./dist/worker.js"
+    },
+    "./sw.default.js": "./dist/sw.default.js",
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "tsup",
-    "typecheck": "tsc --noEmit",
+    "build": "tsup && tsup --config tsup.sw.config.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.sw.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "clean": "rm -rf dist"

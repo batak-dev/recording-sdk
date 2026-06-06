@@ -46,14 +46,20 @@ export interface ResilienceLogRecord {
  * Register background sync to trigger Service Worker retry when network is back
  */
 async function registerBackgroundSync(): Promise<void> {
-  if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
-  
+  // Only meaningful on a page with a serviceWorker container. Cast to `any` so this file
+  // compiles under both the DOM lib (main thread) and the WebWorker lib (service worker),
+  // where `window`/`navigator.serviceWorker` are not declared. In a service worker the
+  // container is absent, so this no-ops.
+  if (typeof navigator === 'undefined') return;
+  const nav = navigator as any;
+
   try {
-    if ('serviceWorker' in navigator && 'sync' in navigator.serviceWorker) {
-      const registration = await navigator.serviceWorker.ready;
-      // @ts-ignore - Background Sync API types
-      await registration.sync.register('retry-queue');
-      console.log('[DB] Background sync registered for pending operations');
+    if (nav.serviceWorker && 'ready' in nav.serviceWorker) {
+      const registration = await nav.serviceWorker.ready;
+      if (registration?.sync?.register) {
+        await registration.sync.register('retry-queue');
+        console.log('[DB] Background sync registered for pending operations');
+      }
     }
   } catch (error) {
     console.warn('[DB] Failed to register background sync:', error);

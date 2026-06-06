@@ -98,8 +98,8 @@ export class NetworkMonitor implements INetworkMonitor {
       }
     };
 
-    window.addEventListener('online', this.onlineListener);
-    window.addEventListener('offline', this.offlineListener);
+    self.addEventListener('online', this.onlineListener);
+    self.addEventListener('offline', this.offlineListener);
     
     // Check initial state
     if (!navigator.onLine) {
@@ -116,7 +116,7 @@ export class NetworkMonitor implements INetworkMonitor {
     await this.measureThroughput();
     
     // Periodic measurements
-    this.testInterval = window.setInterval(async () => {
+    this.testInterval = self.setInterval(async () => {
       if (this.isMonitoring) {
         await this.measureThroughput();
       }
@@ -132,10 +132,10 @@ export class NetworkMonitor implements INetworkMonitor {
     
     // Remove event listeners
     if (this.onlineListener) {
-      window.removeEventListener('online', this.onlineListener);
+      self.removeEventListener('online', this.onlineListener);
     }
     if (this.offlineListener) {
-      window.removeEventListener('offline', this.offlineListener);
+      self.removeEventListener('offline', this.offlineListener);
     }
   }
 
