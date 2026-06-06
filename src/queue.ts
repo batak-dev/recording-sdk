@@ -1,5 +1,5 @@
 /**
- * `@ta/recording-sdk/queue` — resilient offline request queue.
+ * `@batak-dev/recording-sdk/queue` — resilient offline request queue.
  *
  * Persists recording requests/chunks to IndexedDB, resolves dependencies, retries
  * with exponential backoff, and coordinates with the service worker for background

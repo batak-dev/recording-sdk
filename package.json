@@ -1,5 +1,5 @@
 {
-  "name": "@ta/recording-sdk",
+  "name": "@batak-dev/recording-sdk",
   "version": "0.1.0",
   "description": "Extensible, resilient WebCodecs video-recording SDK: adaptive quality, signed chunked upload, offline queue, service-worker background sync, and resilience telemetry.",
   "type": "module",

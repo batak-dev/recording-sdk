@@ -1,5 +1,5 @@
 /**
- * `@ta/recording-sdk/network` — network monitoring + adaptive-quality presets.
+ * `@batak-dev/recording-sdk/network` — network monitoring + adaptive-quality presets.
  */
 export { NetworkMonitor } from './networkMonitor';
 export type { NetworkQuality, NetworkStats, NetworkMonitorOptions, INetworkMonitor } from './networkMonitor';

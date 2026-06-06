@@ -1,5 +1,5 @@
 /**
- * `@ta/recording-sdk/transport` — backend transport seam.
+ * `@batak-dev/recording-sdk/transport` — backend transport seam.
  */
 export type {
   ITransport,

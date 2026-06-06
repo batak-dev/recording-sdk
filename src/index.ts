@@ -1,14 +1,14 @@
 /**
- * @ta/recording-sdk — main entry.
+ * @batak-dev/recording-sdk — main entry.
  *
  * Re-exports the recorder, adaptive-quality, crypto, and signed-chunk primitives.
  * Sub-systems are available via subpath entries:
- *   - `@ta/recording-sdk/queue`      offline queue manager + recording handlers
- *   - `@ta/recording-sdk/storage`    IndexedDB persistence + blob storage
- *   - `@ta/recording-sdk/network`    network monitor + quality presets
- *   - `@ta/recording-sdk/resilience` resilience telemetry collector + metrics
- *   - `@ta/recording-sdk/transport`  transport interface (backend seam)
- *   - `@ta/recording-sdk/auth`       auth-token provider interface
+ *   - `@batak-dev/recording-sdk/queue`      offline queue manager + recording handlers
+ *   - `@batak-dev/recording-sdk/storage`    IndexedDB persistence + blob storage
+ *   - `@batak-dev/recording-sdk/network`    network monitor + quality presets
+ *   - `@batak-dev/recording-sdk/resilience` resilience telemetry collector + metrics
+ *   - `@batak-dev/recording-sdk/transport`  transport interface (backend seam)
+ *   - `@batak-dev/recording-sdk/auth`       auth-token provider interface
  */
 
 // Core recorder

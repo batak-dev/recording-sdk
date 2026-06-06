@@ -1,4 +1,4 @@
-# @ta/recording-sdk
+# @batak-dev/recording-sdk
 
 Extensible, resilient **WebCodecs video-recording SDK**: adaptive quality, AI background
 effects, signed chunked upload, an offline IndexedDB queue with service-worker background sync,
@@ -13,7 +13,7 @@ provider).
 ## Install
 
 ```bash
-npm install @ta/recording-sdk
+npm install @batak-dev/recording-sdk
 ```
 
 This package is published to GitHub Packages. Add to your `.npmrc`:
@@ -26,20 +26,20 @@ This package is published to GitHub Packages. Add to your `.npmrc`:
 
 | Import | Contents |
 | --- | --- |
-| `@ta/recording-sdk` | `VideoRecorder`, codec presets, crypto, signed-chunk format, network/quality, interfaces |
-| `@ta/recording-sdk/queue` | `OfflineQueueManager`, recording request handlers, enqueue helpers |
-| `@ta/recording-sdk/storage` | IndexedDB persistence + blob store (the shared schema) |
-| `@ta/recording-sdk/network` | `NetworkMonitor`, quality presets |
-| `@ta/recording-sdk/resilience` | `ResilienceCollector`, metrics |
-| `@ta/recording-sdk/transport` | `ITransport` seam + default `RecordingServiceTransport` + API DTOs |
-| `@ta/recording-sdk/auth` | `IAuthTokenProvider` seam |
-| `@ta/recording-sdk/sw` | `registerRecordingWorker`, `configureRecordingWorker`, `triggerBackgroundSync` |
-| `@ta/recording-sdk/sw/worker` | `createRecordingWorker()` factory (bundle into your own worker entry) |
+| `@batak-dev/recording-sdk` | `VideoRecorder`, codec presets, crypto, signed-chunk format, network/quality, interfaces |
+| `@batak-dev/recording-sdk/queue` | `OfflineQueueManager`, recording request handlers, enqueue helpers |
+| `@batak-dev/recording-sdk/storage` | IndexedDB persistence + blob store (the shared schema) |
+| `@batak-dev/recording-sdk/network` | `NetworkMonitor`, quality presets |
+| `@batak-dev/recording-sdk/resilience` | `ResilienceCollector`, metrics |
+| `@batak-dev/recording-sdk/transport` | `ITransport` seam + default `RecordingServiceTransport` + API DTOs |
+| `@batak-dev/recording-sdk/auth` | `IAuthTokenProvider` seam |
+| `@batak-dev/recording-sdk/sw` | `registerRecordingWorker`, `configureRecordingWorker`, `triggerBackgroundSync` |
+| `@batak-dev/recording-sdk/sw/worker` | `createRecordingWorker()` factory (bundle into your own worker entry) |
 
 ## Quick start
 
 ```ts
-import { VideoRecorder } from '@ta/recording-sdk';
+import { VideoRecorder } from '@batak-dev/recording-sdk';
 
 const recorder = new VideoRecorder({
   codecKey: 'vp9_opus',
@@ -59,13 +59,13 @@ await recorder.stop();
 ## Offline queue + transport
 
 ```ts
-import { OfflineQueueManager, setupRequestHandlers } from '@ta/recording-sdk/queue';
-import type { ITransport } from '@ta/recording-sdk/transport';
-import type { IAuthTokenProvider } from '@ta/recording-sdk/auth';
+import { OfflineQueueManager, setupRequestHandlers } from '@batak-dev/recording-sdk/queue';
+import type { ITransport } from '@batak-dev/recording-sdk/transport';
+import type { IAuthTokenProvider } from '@batak-dev/recording-sdk/auth';
 
 // Default transport targets the recording-service presigned-URL REST contract.
 // Pass any axios-compatible client (e.g. Nuxt's `$api`) + the service base URL.
-import { RecordingServiceTransport } from '@ta/recording-sdk/transport';
+import { RecordingServiceTransport } from '@batak-dev/recording-sdk/transport';
 
 const transport: ITransport = new RecordingServiceTransport($api, {
   baseURL: recordingServiceUrl
@@ -85,9 +85,9 @@ A service worker drives offline retry / background sync. Because a runtime worke
 module worker (Chromium), so register with `{ type: 'module' }`:
 
 ```ts
-import { registerRecordingWorker } from '@ta/recording-sdk/sw';
+import { registerRecordingWorker } from '@batak-dev/recording-sdk/sw';
 
-// copy node_modules/@ta/recording-sdk/dist/sw.default.js to /sw.js at build time
+// copy node_modules/@batak-dev/recording-sdk/dist/sw.default.js to /sw.js at build time
 await registerRecordingWorker('/sw.js', { recordingServiceUrl });
 ```
 
@@ -96,7 +96,7 @@ self-contained worker file:
 
 ```ts
 // sw-entry.ts  (bundled to /sw.js by your build)
-import { createRecordingWorker } from '@ta/recording-sdk/sw/worker';
+import { createRecordingWorker } from '@batak-dev/recording-sdk/sw/worker';
 
 createRecordingWorker({
   recordingServiceUrl,
