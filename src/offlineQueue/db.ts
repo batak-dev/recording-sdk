@@ -1,0 +1,569 @@
+/**
+ * IndexedDB service for offline queue persistence
+ */
+
+import type {
+  QueuedRequest,
+  StoredChunk,
+  RecordingMetadata,
+  RequestStatus,
+  PresignedUrlCache,
+  AuthTokenCache
+} from './types';
+import type { ResilienceEvent, ResilienceSessionMeta } from '../resilience/types';
+
+const DB_NAME = 'RecordingOfflineDB';
+const DB_VERSION = 5;
+
+// Store names
+export const STORES = {
+  REQUESTS: 'pendingRequests',
+  CHUNKS: 'pendingChunks',
+  METADATA: 'recordingMetadata',
+  PRESIGNED_CACHE: 'presignedUrlCache',
+  BLOB_STORE: 'blobStore',
+  AUTH_TOKEN_CACHE: 'authTokenCache',
+  RESILIENCE_LOG: 'resilienceLog'
+};
+
+// Crash-safe snapshot of a recording's resilience event log.
+export interface ResilienceLogRecord {
+  pathIdentifier: string;
+  meta: ResilienceSessionMeta;
+  events: ResilienceEvent[];
+  updatedAt: number;
+}
+
+/**
+ * Register background sync to trigger Service Worker retry when network is back
+ */
+async function registerBackgroundSync(): Promise<void> {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
+  
+  try {
+    if ('serviceWorker' in navigator && 'sync' in navigator.serviceWorker) {
+      const registration = await navigator.serviceWorker.ready;
+      // @ts-ignore - Background Sync API types
+      await registration.sync.register('retry-queue');
+      console.log('[DB] Background sync registered for pending operations');
+    }
+  } catch (error) {
+    console.warn('[DB] Failed to register background sync:', error);
+  }
+}
+
+/**
+ * Initialize and get the IndexedDB database
+ */
+export async function getDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+
+      // Pending requests store
+      if (!db.objectStoreNames.contains(STORES.REQUESTS)) {
+        const requestStore = db.createObjectStore(STORES.REQUESTS, { keyPath: 'id' });
+        requestStore.createIndex('status', 'status', { unique: false });
+        requestStore.createIndex('priority', 'priority', { unique: false });
+        requestStore.createIndex('createdAt', 'createdAt', { unique: false });
+      }
+
+      // Pending chunks store
+      if (!db.objectStoreNames.contains(STORES.CHUNKS)) {
+        const chunkStore = db.createObjectStore(STORES.CHUNKS, { keyPath: ['pathIdentifier', 'chunkIndex'] });
+        chunkStore.createIndex('status', 'status', { unique: false });
+        chunkStore.createIndex('pathIdentifier', 'pathIdentifier', { unique: false });
+      }
+
+      // Recording metadata store
+      if (!db.objectStoreNames.contains(STORES.METADATA)) {
+        const metadataStore = db.createObjectStore(STORES.METADATA, { keyPath: 'pathIdentifier' });
+        metadataStore.createIndex('status', 'status', { unique: false });
+      }
+
+      // Presigned URL cache store
+      if (!db.objectStoreNames.contains(STORES.PRESIGNED_CACHE)) {
+        const cacheStore = db.createObjectStore(STORES.PRESIGNED_CACHE, { keyPath: ['pathIdentifier', 'chunkIndex'] });
+        cacheStore.createIndex('expiresAt', 'expiresAt', { unique: false });
+      }
+
+      // Blob store
+      if (!db.objectStoreNames.contains(STORES.BLOB_STORE)) {
+        const blobStore = db.createObjectStore(STORES.BLOB_STORE, { keyPath: 'id' });
+        blobStore.createIndex('createdAt', 'createdAt', { unique: false });
+      }
+
+      // Auth token cache store (for Service Worker access)
+      if (!db.objectStoreNames.contains(STORES.AUTH_TOKEN_CACHE)) {
+        const authTokenStore = db.createObjectStore(STORES.AUTH_TOKEN_CACHE, { keyPath: 'userId' });
+        authTokenStore.createIndex('sessionId', 'sessionId', { unique: false });
+        authTokenStore.createIndex('expiresAt', 'expiresAt', { unique: false });
+      }
+
+      // Resilience measurement log store (one record per recording, crash-safe)
+      if (!db.objectStoreNames.contains(STORES.RESILIENCE_LOG)) {
+        const resilienceStore = db.createObjectStore(STORES.RESILIENCE_LOG, { keyPath: 'pathIdentifier' });
+        resilienceStore.createIndex('updatedAt', 'updatedAt', { unique: false });
+      }
+    };
+  });
+}
+
+// ==================== Request Operations ====================
+
+export async function addRequest(request: QueuedRequest): Promise<void> {
+  const db = await getDB();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction([STORES.REQUESTS], 'readwrite');
+    const store = transaction.objectStore(STORES.REQUESTS);
+    const req = store.put(request);
+
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+  
+  // Register background sync so SW retries when network returns
+  await registerBackgroundSync();
+}
+
+export async function getRequest(id: string): Promise<QueuedRequest | null> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.REQUESTS], 'readonly');
+    const store = transaction.objectStore(STORES.REQUESTS);
+    const request = store.get(id);
+
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function updateRequest(request: QueuedRequest): Promise<void> {
+  return addRequest(request); // PUT operation updates if exists
+}
+
+export async function deleteRequest(id: string): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.REQUESTS], 'readwrite');
+    const store = transaction.objectStore(STORES.REQUESTS);
+    const request = store.delete(id);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getRequestsByStatus(status: RequestStatus): Promise<QueuedRequest[]> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.REQUESTS], 'readonly');
+    const store = transaction.objectStore(STORES.REQUESTS);
+    const index = store.index('status');
+    const request = index.getAll(status);
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getAllRequests(): Promise<QueuedRequest[]> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.REQUESTS], 'readonly');
+    const store = transaction.objectStore(STORES.REQUESTS);
+    const request = store.getAll();
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ==================== Chunk Operations ====================
+
+export async function addChunk(chunk: StoredChunk): Promise<void> {
+  const db = await getDB();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction([STORES.CHUNKS], 'readwrite');
+    const store = transaction.objectStore(STORES.CHUNKS);
+    const request = store.put(chunk);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+  
+  // Register background sync so SW retries when network returns
+  await registerBackgroundSync();
+}
+
+export async function getChunk(pathIdentifier: string, chunkIndex: number): Promise<StoredChunk | null> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.CHUNKS], 'readonly');
+    const store = transaction.objectStore(STORES.CHUNKS);
+    const request = store.get([pathIdentifier, chunkIndex]);
+
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function updateChunk(chunk: StoredChunk): Promise<void> {
+  return addChunk(chunk); // PUT operation updates if exists
+}
+
+export async function deleteChunk(pathIdentifier: string, chunkIndex: number): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.CHUNKS], 'readwrite');
+    const store = transaction.objectStore(STORES.CHUNKS);
+    const request = store.delete([pathIdentifier, chunkIndex]);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getChunksByPath(pathIdentifier: string): Promise<StoredChunk[]> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.CHUNKS], 'readonly');
+    const store = transaction.objectStore(STORES.CHUNKS);
+    const index = store.index('pathIdentifier');
+    const request = index.getAll(pathIdentifier);
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getChunksByStatus(status: RequestStatus): Promise<StoredChunk[]> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.CHUNKS], 'readonly');
+    const store = transaction.objectStore(STORES.CHUNKS);
+    const index = store.index('status');
+    const request = index.getAll(status);
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getAllChunks(): Promise<StoredChunk[]> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.CHUNKS], 'readonly');
+    const store = transaction.objectStore(STORES.CHUNKS);
+    const request = store.getAll();
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ==================== Metadata Operations ====================
+
+export async function saveMetadata(metadata: RecordingMetadata): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.METADATA], 'readwrite');
+    const store = transaction.objectStore(STORES.METADATA);
+    const request = store.put(metadata);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getMetadata(pathIdentifier: string): Promise<RecordingMetadata | null> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.METADATA], 'readonly');
+    const store = transaction.objectStore(STORES.METADATA);
+    const request = store.get(pathIdentifier);
+
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function deleteMetadata(pathIdentifier: string): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.METADATA], 'readwrite');
+    const store = transaction.objectStore(STORES.METADATA);
+    const request = store.delete(pathIdentifier);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ==================== Presigned URL Cache Operations ====================
+
+export async function cachePresignedUrl(cache: PresignedUrlCache): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.PRESIGNED_CACHE], 'readwrite');
+    const store = transaction.objectStore(STORES.PRESIGNED_CACHE);
+    const request = store.put(cache);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getCachedPresignedUrl(pathIdentifier: string, chunkIndex: number): Promise<PresignedUrlCache | null> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.PRESIGNED_CACHE], 'readonly');
+    const store = transaction.objectStore(STORES.PRESIGNED_CACHE);
+    const request = store.get([pathIdentifier, chunkIndex]);
+
+    request.onsuccess = () => {
+      const result = request.result;
+      // Check if expired
+      if (result && result.expiresAt > Date.now()) {
+        resolve(result);
+      } else {
+        resolve(null);
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function cleanupExpiredPresignedUrls(): Promise<number> {
+  const db = await getDB();
+  const now = Date.now();
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.PRESIGNED_CACHE], 'readwrite');
+    const store = transaction.objectStore(STORES.PRESIGNED_CACHE);
+    const index = store.index('expiresAt');
+    const range = IDBKeyRange.upperBound(now);
+    const request = index.openCursor(range);
+
+    let deletedCount = 0;
+
+    request.onsuccess = (event) => {
+      const cursor = (event.target as IDBRequest).result;
+      if (cursor) {
+        cursor.delete();
+        deletedCount++;
+        cursor.continue();
+      } else {
+        resolve(deletedCount);
+      }
+    };
+
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ==================== Cleanup Operations ====================
+
+export async function cleanupExpiredRequests(): Promise<number> {
+  const requests = await getAllRequests();
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+
+  let deletedCount = 0;
+  for (const request of requests) {
+    if (now - request.createdAt > maxAge && request.status === 'FAILED') {
+      await deleteRequest(request.id);
+      deletedCount++;
+    }
+  }
+
+  return deletedCount;
+}
+
+export async function clearAllData(): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(
+      [STORES.REQUESTS, STORES.CHUNKS, STORES.METADATA, STORES.PRESIGNED_CACHE, STORES.AUTH_TOKEN_CACHE],
+      'readwrite'
+    );
+
+    const stores = [STORES.REQUESTS, STORES.CHUNKS, STORES.METADATA, STORES.PRESIGNED_CACHE, STORES.AUTH_TOKEN_CACHE];
+    stores.forEach(storeName => {
+      transaction.objectStore(storeName).clear();
+    });
+
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+// ==================== Auth Token Cache Operations ====================
+
+export async function cacheAuthToken(tokenData: AuthTokenCache): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.AUTH_TOKEN_CACHE], 'readwrite');
+    const store = transaction.objectStore(STORES.AUTH_TOKEN_CACHE);
+    const request = store.put(tokenData);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getAuthToken(userId: string): Promise<AuthTokenCache | null> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.AUTH_TOKEN_CACHE], 'readonly');
+    const store = transaction.objectStore(STORES.AUTH_TOKEN_CACHE);
+    const request = store.get(userId);
+
+    request.onsuccess = () => {
+      const result = request.result;
+      // Check if expired (with 5-minute buffer)
+      if (result && result.expiresAt > Date.now() + 5 * 60 * 1000) {
+        resolve(result);
+      } else {
+        resolve(null);
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getCurrentAuthToken(): Promise<AuthTokenCache | null> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.AUTH_TOKEN_CACHE], 'readonly');
+    const store = transaction.objectStore(STORES.AUTH_TOKEN_CACHE);
+    const request = store.getAll();
+
+    request.onsuccess = () => {
+      const tokens = request.result;
+      if (tokens.length === 0) {
+        resolve(null);
+        return;
+      }
+      
+      // Return the most recent non-expired token
+      const validTokens = tokens.filter(t => t.expiresAt > Date.now() + 5 * 60 * 1000);
+      if (validTokens.length === 0) {
+        resolve(null);
+        return;
+      }
+      
+      // Sort by createdAt descending and return the newest
+      validTokens.sort((a, b) => b.createdAt - a.createdAt);
+      resolve(validTokens[0]);
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function deleteAuthToken(userId: string): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.AUTH_TOKEN_CACHE], 'readwrite');
+    const store = transaction.objectStore(STORES.AUTH_TOKEN_CACHE);
+    const request = store.delete(userId);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function clearAllAuthTokens(): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.AUTH_TOKEN_CACHE], 'readwrite');
+    const store = transaction.objectStore(STORES.AUTH_TOKEN_CACHE);
+    const request = store.clear();
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function cleanupExpiredAuthTokens(): Promise<number> {
+  const db = await getDB();
+  const now = Date.now();
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.AUTH_TOKEN_CACHE], 'readwrite');
+    const store = transaction.objectStore(STORES.AUTH_TOKEN_CACHE);
+    const index = store.index('expiresAt');
+    const range = IDBKeyRange.upperBound(now);
+    const request = index.openCursor(range);
+
+    let deletedCount = 0;
+
+    request.onsuccess = (event) => {
+      const cursor = (event.target as IDBRequest).result;
+      if (cursor) {
+        cursor.delete();
+        deletedCount++;
+        cursor.continue();
+      } else {
+        resolve(deletedCount);
+      }
+    };
+
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ==================== Resilience Log Operations ====================
+
+export async function saveResilienceLog(record: ResilienceLogRecord): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.RESILIENCE_LOG], 'readwrite');
+    const store = transaction.objectStore(STORES.RESILIENCE_LOG);
+    const request = store.put(record);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getResilienceLog(pathIdentifier: string): Promise<ResilienceLogRecord | null> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.RESILIENCE_LOG], 'readonly');
+    const store = transaction.objectStore(STORES.RESILIENCE_LOG);
+    const request = store.get(pathIdentifier);
+
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function listResilienceLogPaths(): Promise<string[]> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.RESILIENCE_LOG], 'readonly');
+    const store = transaction.objectStore(STORES.RESILIENCE_LOG);
+    const request = store.getAllKeys();
+
+    request.onsuccess = () => resolve((request.result || []) as string[]);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function deleteResilienceLog(pathIdentifier: string): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORES.RESILIENCE_LOG], 'readwrite');
+    const store = transaction.objectStore(STORES.RESILIENCE_LOG);
+    const request = store.delete(pathIdentifier);
+
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
