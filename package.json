@@ -74,6 +74,7 @@
   "devDependencies": {
     "@types/dom-mediacapture-transform": "^0.1.10",
     "@types/dom-webcodecs": "^0.1.13",
+    "happy-dom": "^20.10.1",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
