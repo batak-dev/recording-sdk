@@ -22,7 +22,19 @@ export async function registerRecordingWorker(
 ): Promise<ServiceWorkerRegistration | null> {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
 
-  const registration = await navigator.serviceWorker.register(scriptUrl, {
+  // Pin the recording-service URL onto the worker's own script URL. SET_CONFIG only lives in a
+  // running worker's memory, so a Background-Sync-woken worker (page already closed) would
+  // otherwise fall back to the built-in default and fail every backend call. The script URL is
+  // persisted with the registration and exposed via self.location, so the worker recovers the
+  // URL synchronously at startup even after termination. (configureRecordingWorker below still
+  // sends SET_CONFIG for same-session runtime updates.)
+  let registerUrl = scriptUrl;
+  if (options.recordingServiceUrl) {
+    const separator = scriptUrl.includes('?') ? '&' : '?';
+    registerUrl = `${scriptUrl}${separator}recordingServiceUrl=${encodeURIComponent(options.recordingServiceUrl)}`;
+  }
+
+  const registration = await navigator.serviceWorker.register(registerUrl, {
     scope: options.scope ?? '/',
     type: options.type
   });

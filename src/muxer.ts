@@ -15,6 +15,9 @@ interface SegmentSink {
 export class ChunkMuxer {
   private muxer: Muxer<StreamTarget> | null = null;
   private activeSink: SegmentSink | null = null;
+  // Shared timeline origin for the active segment. Both the video and audio tracks are
+  // re-based against this single value so the real capture offset between them is kept.
+  private segmentBaseTimestampUs: number | null = null;
   private chunkCounter = 1;
   private currentQuestionOrder = 1;
   private videoMetaCache: EncodedVideoChunkMetadata | undefined;
@@ -57,6 +60,7 @@ export class ChunkMuxer {
     // later segment installs a fresh sink without disturbing this one.
     const sink: SegmentSink = { buffer: new Uint8Array(0), length: 0 };
     this.activeSink = sink;
+    this.segmentBaseTimestampUs = null;
     this.muxer = new Muxer({
       target: new StreamTarget({
         onData: (data: Uint8Array, position: number) => {
@@ -78,8 +82,25 @@ export class ChunkMuxer {
       }),
       video: { codec: this.codec.muxerVideoCodec, width: this.videoWidth, height: this.videoHeight },
       audio: { codec: this.codec.muxerAudioCodec, sampleRate: 48000, numberOfChannels: 1 },
-      firstTimestampBehavior: 'offset'
+      // 'permissive' lets a track start at a non-zero timestamp. We re-base both tracks
+      // ourselves against one shared origin (see rebaseTimestamp) instead of letting the
+      // muxer's 'offset' mode zero each track independently, which would break A/V sync.
+      firstTimestampBehavior: 'permissive'
     });
+  }
+
+  // Re-base a chunk's capture timestamp (microseconds) against a single per-segment
+  // origin shared by BOTH tracks. The first chunk added to a segment — from whichever
+  // track — defines the origin; in practice audio (lowest latency, earliest timestamp)
+  // comes first, so video stays correctly offset behind it (e.g. by the camera warm-up
+  // delay) rather than being snapped to 0. The clamp guards the rare case where the
+  // other track's first chunk carries a slightly earlier timestamp than the origin.
+  private rebaseTimestamp(timestampUs: number): number {
+    if (this.segmentBaseTimestampUs === null) {
+      this.segmentBaseTimestampUs = timestampUs;
+    }
+    const rebased = timestampUs - this.segmentBaseTimestampUs;
+    return rebased > 0 ? rebased : 0;
   }
 
   addVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata) {
@@ -91,7 +112,7 @@ export class ChunkMuxer {
       // This preserves all data and prevents gaps during segment rotation
       this.createNewSegment();
     }
-    this.muxer!.addVideoChunk(chunk, meta || this.videoMetaCache);
+    this.muxer!.addVideoChunk(chunk, meta || this.videoMetaCache, this.rebaseTimestamp(chunk.timestamp));
   }
 
   addAudioChunk(chunk: EncodedAudioChunk, meta?: EncodedAudioChunkMetadata) {
@@ -103,7 +124,7 @@ export class ChunkMuxer {
       // This preserves all data and prevents gaps during segment rotation
       this.createNewSegment();
     }
-    this.muxer!.addAudioChunk(chunk, meta || this.audioMetaCache);
+    this.muxer!.addAudioChunk(chunk, meta || this.audioMetaCache, this.rebaseTimestamp(chunk.timestamp));
   }
 
   async finalizeSegment(): Promise<RecordingChunk | null> {

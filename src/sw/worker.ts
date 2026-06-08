@@ -63,7 +63,20 @@ export interface RecordingWorkerOptions {
 export function createRecordingWorker(options: RecordingWorkerOptions = {}): void {
   if (options.schema) setRecordingDbSchema(options.schema);
 
-  let recordingServiceUrl = options.recordingServiceUrl ?? 'http://localhost:8082';
+  // The recording-service URL the page pinned onto the worker's script URL (see
+  // registerRecordingWorker). Read from self.location so a Background-Sync-woken worker has the
+  // correct backend even after termination, when no page is around to (re)send SET_CONFIG.
+  const urlFromLocation = (): string | undefined => {
+    try {
+      const search = (sw as any).location?.search as string | undefined;
+      if (!search) return undefined;
+      return new URLSearchParams(search).get('recordingServiceUrl') ?? undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  let recordingServiceUrl = options.recordingServiceUrl ?? urlFromLocation() ?? 'http://localhost:8082';
   const endpoints: RecordingWorkerEndpoints = { ...DEFAULT_ENDPOINTS, ...options.endpoints };
   const maxChunkAttempts = options.maxChunkAttempts ?? 5;
   const autoRetryIntervalMs = options.autoRetryIntervalMs ?? 10000;
