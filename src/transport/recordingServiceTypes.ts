@@ -109,6 +109,14 @@ export interface OceanScores {
   extraversion: number;
   agreeableness: number;
   neuroticism: number;
+
+  answer_score?: number;
+  confidence_score?: number;
+  facial_expression?: number;
+  interview_score?: number;
+  overall_performance?: number;
+  overall_personality?: number;
+  speaking_skills?: number;
 }
 
 export interface OceanResult {
