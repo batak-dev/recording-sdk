@@ -41,63 +41,111 @@ export const STORE_NAMES = {
 } as const;
 
 /**
- * The default recording schema.
- *
- * v6 prunes the obsolete `pendingTimeline` store (per-question video splitting now uses the
- * `questionOrder` carried in each chunk, so a separate timeline store is no longer needed).
- * The pruning happens generically in {@link applySchema}: any object store present in the DB
- * but absent from this descriptor is dropped during the version upgrade.
+ * Stores the engine owns outright: the durable request queue, blob staging, the resilience
+ * log, and the minimal chunk store. These are the plumbing the offline/retry/background-sync
+ * guarantee is built on — a consumer cannot redefine them. Backend-specific fields on a
+ * chunk are carried in the operation payloads, not by redefining the store shape.
  */
-export const DEFAULT_SCHEMA: SchemaDescriptor = {
-  dbName: 'RecordingOfflineDB',
-  version: 6,
-  stores: [
-    {
-      name: STORE_NAMES.REQUESTS,
-      keyPath: 'id',
-      indexes: [
-        { name: 'status', keyPath: 'status' },
-        { name: 'priority', keyPath: 'priority' },
-        { name: 'createdAt', keyPath: 'createdAt' }
-      ]
-    },
-    {
-      name: STORE_NAMES.CHUNKS,
-      keyPath: ['pathIdentifier', 'chunkIndex'],
-      indexes: [
-        { name: 'status', keyPath: 'status' },
-        { name: 'pathIdentifier', keyPath: 'pathIdentifier' }
-      ]
-    },
-    {
-      name: STORE_NAMES.METADATA,
-      keyPath: 'pathIdentifier',
-      indexes: [{ name: 'status', keyPath: 'status' }]
-    },
-    {
-      name: STORE_NAMES.PRESIGNED_CACHE,
-      keyPath: ['pathIdentifier', 'chunkIndex'],
-      indexes: [{ name: 'expiresAt', keyPath: 'expiresAt' }]
-    },
-    {
-      name: STORE_NAMES.BLOB_STORE,
-      keyPath: 'id',
-      indexes: [{ name: 'createdAt', keyPath: 'createdAt' }]
-    },
-    {
-      name: STORE_NAMES.AUTH_TOKEN_CACHE,
-      keyPath: 'userId',
-      indexes: [
-        { name: 'sessionId', keyPath: 'sessionId' },
-        { name: 'expiresAt', keyPath: 'expiresAt' }
-      ]
-    },
-    {
-      name: STORE_NAMES.RESILIENCE_LOG,
-      keyPath: 'pathIdentifier',
-      indexes: [{ name: 'updatedAt', keyPath: 'updatedAt' }]
+export const ENGINE_STORES: StoreDescriptor[] = [
+  {
+    name: STORE_NAMES.REQUESTS,
+    keyPath: 'id',
+    indexes: [
+      { name: 'status', keyPath: 'status' },
+      { name: 'priority', keyPath: 'priority' },
+      { name: 'createdAt', keyPath: 'createdAt' }
+    ]
+  },
+  {
+    name: STORE_NAMES.CHUNKS,
+    keyPath: ['pathIdentifier', 'chunkIndex'],
+    indexes: [
+      { name: 'status', keyPath: 'status' },
+      { name: 'pathIdentifier', keyPath: 'pathIdentifier' }
+    ]
+  },
+  {
+    name: STORE_NAMES.BLOB_STORE,
+    keyPath: 'id',
+    indexes: [{ name: 'createdAt', keyPath: 'createdAt' }]
+  },
+  {
+    name: STORE_NAMES.RESILIENCE_LOG,
+    keyPath: 'pathIdentifier',
+    indexes: [{ name: 'updatedAt', keyPath: 'updatedAt' }]
+  }
+];
+
+/** Names of the engine-owned stores; consumer (domain) stores may not reuse these. */
+export const ENGINE_STORE_NAMES: readonly string[] = ENGINE_STORES.map((s) => s.name);
+
+/**
+ * The built-in recording-service domain stores. These are *not* engine-owned: in a later
+ * phase they move to the consumer's config. Declared here so the default schema keeps
+ * working with zero config.
+ */
+export const RECORDING_DOMAIN_STORES: StoreDescriptor[] = [
+  {
+    name: STORE_NAMES.METADATA,
+    keyPath: 'pathIdentifier',
+    indexes: [{ name: 'status', keyPath: 'status' }]
+  },
+  {
+    name: STORE_NAMES.PRESIGNED_CACHE,
+    keyPath: ['pathIdentifier', 'chunkIndex'],
+    indexes: [{ name: 'expiresAt', keyPath: 'expiresAt' }]
+  },
+  {
+    name: STORE_NAMES.AUTH_TOKEN_CACHE,
+    keyPath: 'userId',
+    indexes: [
+      { name: 'sessionId', keyPath: 'sessionId' },
+      { name: 'expiresAt', keyPath: 'expiresAt' }
+    ]
+  }
+];
+
+/**
+ * Merge engine-owned stores with consumer-declared domain stores into one descriptor list.
+ * Throws if a consumer store collides with an engine-owned store or duplicates another
+ * consumer store, so the durability plumbing can never be silently overridden. This is the
+ * function the config facade calls to assemble the final schema.
+ */
+export function mergeStores(engine: StoreDescriptor[], user: StoreDescriptor[]): StoreDescriptor[] {
+  const engineNames = new Set(engine.map((s) => s.name));
+  const seen = new Set<string>();
+  const merged: StoreDescriptor[] = [...engine];
+  for (const store of user) {
+    if (engineNames.has(store.name)) {
+      throw new Error(`Store "${store.name}" is engine-owned and cannot be redefined by config.`);
     }
-  ]
+    if (seen.has(store.name)) {
+      throw new Error(`Duplicate store "${store.name}" in config.`);
+    }
+    seen.add(store.name);
+    merged.push(store);
+  }
+  return merged;
+}
+
+/**
+ * The default recording schema: engine stores + the built-in recording-service domain
+ * stores. v6 prunes the obsolete `pendingTimeline` store (per-question video splitting now
+ * uses the `questionOrder` carried in each chunk). The pruning happens generically in
+ * {@link applySchema}: any object store present in the DB but absent from this descriptor is
+ * dropped during the version upgrade.
+ */
+/** Schema version owned by the engine. `defineRecordingConfig` takes the max of this and
+ *  any consumer `schemaVersion`, so both engine and consumer upgrades force onupgradeneeded. */
+export const ENGINE_SCHEMA_VERSION = 6;
+
+/** Default IndexedDB name; overridable via config. */
+export const DEFAULT_DB_NAME = 'RecordingOfflineDB';
+
+export const DEFAULT_SCHEMA: SchemaDescriptor = {
+  dbName: DEFAULT_DB_NAME,
+  version: ENGINE_SCHEMA_VERSION,
+  stores: mergeStores(ENGINE_STORES, RECORDING_DOMAIN_STORES)
 };
 
 /**

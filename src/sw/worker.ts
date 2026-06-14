@@ -17,42 +17,73 @@ import * as db from '../offlineQueue/db';
 import * as blobStorage from '../offlineQueue/blobStorage';
 import { setRecordingDbSchema } from '../offlineQueue/db';
 import type { SchemaDescriptor } from '../storage/schema';
-import { Priority } from '../offlineQueue/types';
-import type { QueuedRequest, RequestType, StoredChunk } from '../offlineQueue/types';
+import type { QueuedRequest, StoredChunk } from '../offlineQueue/types';
+import {
+  type OperationContext,
+  type OperationRegistry,
+  type RecordingEndpoints,
+  type EngineTimings,
+  priorityFor,
+  isChunkDriven,
+  DEFAULT_TIMINGS
+} from '../offlineQueue/operations';
+import {
+  recordingOperationRegistry,
+  processRecordingChunk,
+  processRecordingRequest,
+  markChunkRequestsFailed,
+  DEFAULT_ENDPOINTS,
+  DEFAULT_BASE_URL,
+  DEFAULT_UPLOAD_CONTENT_TYPE
+} from '../offlineQueue/recordingOperations';
 
 // `self` is the ServiceWorkerGlobalScope; cast once so we get clients/registration/etc.
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
-export interface RecordingWorkerEndpoints {
-  start: (baseUrl: string, pathIdentifier: string) => string;
-  complete: (baseUrl: string, pathIdentifier: string) => string;
-  presigned: (baseUrl: string, pathIdentifier: string) => string;
-}
+/** @deprecated Use `RecordingEndpoints` from the operations module. */
+export type RecordingWorkerEndpoints = RecordingEndpoints;
 
-const DEFAULT_ENDPOINTS: RecordingWorkerEndpoints = {
-  start: (base, id) => `${base}/api/v0/all/recordings/${id}/start`,
-  complete: (base, id) => `${base}/api/v0/all/recordings/${id}/complete`,
-  presigned: (base, id) => `${base}/api/v0/all/recordings/${id}/presigned`
-};
-
+/**
+ * Worker input. Preferred: pass a `ResolvedRecordingConfig` from `defineRecordingConfig` —
+ * the page and the worker then share one config object. All fields are optional; the legacy
+ * fields are still honored for back-compat.
+ */
 export interface RecordingWorkerOptions {
-  /** Recording-service base URL. Can also be set/updated at runtime via a SET_CONFIG message. */
-  recordingServiceUrl?: string;
+  /** Backend base URL (preferred). Also recoverable from the worker script URL / SET_CONFIG. */
+  baseUrl?: string;
   /** Custom IndexedDB schema (registered via setRecordingDbSchema). */
   schema?: SchemaDescriptor;
-  /** Resolve the bearer token. Defaults to the most-recent valid token in the auth-token cache. */
-  getAuthToken?: () => Promise<string | null>;
+  /** Operation registry. Defaults to the built-in recording-service operations. */
+  operations?: OperationRegistry;
+  /** Per-chunk processor (engine owns the loop). Defaults to the recording-service one. */
+  processChunk?: (ctx: OperationContext, chunk: StoredChunk) => Promise<void>;
+  /** Resolve the bearer token from engine storage. */
+  resolveAuthToken?: (database: typeof db) => Promise<string | null>;
   /** Override the REST endpoint URLs (target a different backend). */
-  endpoints?: Partial<RecordingWorkerEndpoints>;
-  /** Max upload attempts before a chunk is marked FAILED (default 5). */
-  maxChunkAttempts?: number;
-  /** Delay before re-running the retry loop while operations remain (default 10000ms). */
-  autoRetryIntervalMs?: number;
-  /** Minimum gap between fetch-triggered pending checks (default 30000ms). */
-  networkCheckIntervalMs?: number;
+  endpoints?: Partial<RecordingEndpoints>;
+  /** Timing knobs (merged over the engine defaults). */
+  timings?: Partial<EngineTimings>;
   /** Content-Type used for the object-store PUT upload (default 'video/webm'). */
   uploadContentType?: string;
-  /** How long a freshly fetched presigned URL is considered valid (default 10min). */
+
+  // Present on ResolvedRecordingConfig but unused by the worker (page-only); accepted so the
+  // whole resolved config object can be passed through unchanged.
+  codecs?: unknown;
+  transport?: unknown;
+  authProvider?: unknown;
+
+  // ---- Legacy aliases (deprecated; still honored) ----
+  /** @deprecated use `baseUrl` */
+  recordingServiceUrl?: string;
+  /** @deprecated use `resolveAuthToken` */
+  getAuthToken?: () => Promise<string | null>;
+  /** @deprecated use `timings.maxChunkAttempts` */
+  maxChunkAttempts?: number;
+  /** @deprecated use `timings.autoRetryIntervalMs` */
+  autoRetryIntervalMs?: number;
+  /** @deprecated use `timings.networkCheckIntervalMs` */
+  networkCheckIntervalMs?: number;
+  /** @deprecated use `timings.presignedTtlMs` */
   presignedTtlMs?: number;
 }
 
@@ -76,32 +107,46 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
     }
   };
 
-  let recordingServiceUrl = options.recordingServiceUrl ?? urlFromLocation() ?? 'http://localhost:8082';
-  const endpoints: RecordingWorkerEndpoints = { ...DEFAULT_ENDPOINTS, ...options.endpoints };
-  const maxChunkAttempts = options.maxChunkAttempts ?? 5;
-  const autoRetryIntervalMs = options.autoRetryIntervalMs ?? 10000;
-  const networkCheckIntervalMs = options.networkCheckIntervalMs ?? 30000;
-  const uploadContentType = options.uploadContentType ?? 'video/webm';
-  const presignedTtlMs = options.presignedTtlMs ?? 10 * 60 * 1000;
+  let recordingServiceUrl =
+    options.baseUrl ?? options.recordingServiceUrl ?? urlFromLocation() ?? DEFAULT_BASE_URL;
+  const endpoints: RecordingEndpoints = { ...DEFAULT_ENDPOINTS, ...options.endpoints };
+  const operations: OperationRegistry = options.operations ?? recordingOperationRegistry;
+  const processChunk = options.processChunk ?? processRecordingChunk;
+  const maxChunkAttempts =
+    options.timings?.maxChunkAttempts ?? options.maxChunkAttempts ?? DEFAULT_TIMINGS.maxChunkAttempts;
+  const autoRetryIntervalMs =
+    options.timings?.autoRetryIntervalMs ?? options.autoRetryIntervalMs ?? DEFAULT_TIMINGS.autoRetryIntervalMs;
+  const networkCheckIntervalMs =
+    options.timings?.networkCheckIntervalMs ??
+    options.networkCheckIntervalMs ??
+    DEFAULT_TIMINGS.networkCheckIntervalMs;
+  const uploadContentType = options.uploadContentType ?? DEFAULT_UPLOAD_CONTENT_TYPE;
+  const presignedTtlMs =
+    options.timings?.presignedTtlMs ?? options.presignedTtlMs ?? DEFAULT_TIMINGS.presignedTtlMs;
 
   const getAuthToken =
-    options.getAuthToken ?? (async () => (await db.getCurrentAuthToken())?.token ?? null);
+    (options.resolveAuthToken ? () => options.resolveAuthToken!(db) : options.getAuthToken) ??
+    (async () => (await db.getCurrentAuthToken())?.token ?? null);
 
   const isOnline = () => sw.navigator?.onLine !== false;
 
-  function getRequestPriority(type: RequestType): Priority {
-    switch (type) {
-      case 'START_RECORDING':
-        return Priority.CRITICAL;
-      case 'PRESIGNED_URL':
-      case 'UPLOAD_CHUNK':
-        return Priority.HIGH;
-      case 'COMPLETE_RECORDING':
-        return Priority.LOW;
-      default:
-        return Priority.MEDIUM;
-    }
-  }
+  // Build a fresh operation context per drain pass so `baseUrl` reflects the latest
+  // recordingServiceUrl (it can change at runtime via SET_CONFIG). The worker's
+  // (url, init) authedFetch is adapted to the context's RequestSpec shape.
+  const buildContext = (): OperationContext => ({
+    baseUrl: recordingServiceUrl,
+    endpoints,
+    timings: { maxChunkAttempts, presignedTtlMs, autoRetryIntervalMs, networkCheckIntervalMs },
+    uploadContentType,
+    authedFetch: (spec) =>
+      authenticatedFetch(spec.url, {
+        method: spec.method,
+        headers: spec.headers,
+        body: spec.body ?? undefined
+      }),
+    db,
+    blobStorage
+  });
 
   async function notifyClients(message: any): Promise<void> {
     const clients = await sw.clients.matchAll({ type: 'window' });
@@ -127,94 +172,10 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
     return message.includes('Failed to fetch') || message.includes('NetworkError') || !isOnline();
   }
 
-  // ---- Auth bookkeeping for chunk-associated requests --------------------------------
-
-  async function markChunkRequestsNeedsAuth(chunk: StoredChunk): Promise<void> {
-    for (const id of [chunk.uploadRequestId, chunk.presignedRequestId]) {
-      if (!id) continue;
-      const req = await db.getRequest(id);
-      if (req && req.status !== 'COMPLETED') {
-        req.status = 'NEEDS_AUTH';
-        req.updatedAt = Date.now();
-        await db.updateRequest(req);
-      }
-    }
-  }
-
-  async function markChunkRequestCompleted(chunk: StoredChunk): Promise<void> {
-    for (const id of [chunk.uploadRequestId, chunk.presignedRequestId]) {
-      if (!id) continue;
-      const req = await db.getRequest(id);
-      if (req && req.status !== 'COMPLETED') {
-        req.status = 'COMPLETED';
-        req.updatedAt = Date.now();
-        await db.updateRequest(req);
-      }
-    }
-  }
-
-  // When a chunk is permanently FAILED, fail its chunk-driven requests too. The retry loop
-  // skips PRESIGNED_URL/UPLOAD_CHUNK requests (the chunk loop owns them), so leaving them
-  // PENDING would otherwise keep `remaining` > 0 forever and block COMPLETE_RECORDING's deps.
-  async function markChunkRequestsFailed(chunk: StoredChunk, error: string): Promise<void> {
-    for (const id of [chunk.uploadRequestId, chunk.presignedRequestId]) {
-      if (!id) continue;
-      const req = await db.getRequest(id);
-      if (req && req.status !== 'COMPLETED' && req.status !== 'FAILED') {
-        req.status = 'FAILED';
-        req.error = error;
-        req.updatedAt = Date.now();
-        await db.updateRequest(req);
-      }
-    }
-  }
-
-  // ---- Chunk processing --------------------------------------------------------------
-
-  async function processChunk(chunk: StoredChunk): Promise<void> {
-    const blob = await blobStorage.retrieveBlob(chunk.blobId);
-    if (!blob) throw new Error(`Blob ${chunk.blobId} not found`);
-
-    let uploadUrl = chunk.presignedUrl;
-    const expired = !chunk.presignedUrlExpiresAt || chunk.presignedUrlExpiresAt < Date.now();
-
-    if (!uploadUrl || expired) {
-      try {
-        const response = await authenticatedFetch(endpoints.presigned(recordingServiceUrl, chunk.pathIdentifier), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chunk_index: chunk.chunkIndex })
-        });
-        if (!response.ok) throw new Error(`Presigned URL request failed: ${response.status}`);
-
-        const data = await response.json();
-        uploadUrl = data.presigned_url;
-        chunk.presignedUrl = uploadUrl;
-        chunk.presignedUrlExpiresAt = Date.now() + presignedTtlMs;
-        await db.updateChunk(chunk);
-      } catch (error: any) {
-        if (error.message === 'AUTH_TOKEN_UNAVAILABLE' || error.message === 'AUTH_TOKEN_EXPIRED') {
-          await markChunkRequestsNeedsAuth(chunk);
-          throw new Error('AUTH_TOKEN_UNAVAILABLE');
-        }
-        throw error;
-      }
-    }
-
-    const response = await fetch(uploadUrl!, {
-      method: 'PUT',
-      body: blob,
-      headers: { 'Content-Type': uploadContentType }
-    });
-    if (!response.ok) throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
-
-    chunk.status = 'COMPLETED';
-    await db.updateChunk(chunk);
-    await markChunkRequestCompleted(chunk);
-    await blobStorage.deleteBlob(chunk.blobId);
-  }
-
-  // ---- Request processing ------------------------------------------------------------
+  // Chunk/request processing (the recording-service operations) live in
+  // ../offlineQueue/recordingOperations and run against an OperationContext from
+  // buildContext() above. The engine skeleton below owns the drain loop, retry/attempt
+  // bookkeeping, Background Sync arming, and client notifications.
 
   async function checkDependencies(request: QueuedRequest): Promise<boolean> {
     if (!request.dependencies || request.dependencies.length === 0) return true;
@@ -223,44 +184,6 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
       if (!dep || dep.status !== 'COMPLETED') return false;
     }
     return true;
-  }
-
-  async function processRequest(request: QueuedRequest): Promise<void> {
-    request.status = 'IN_PROGRESS';
-    request.updatedAt = Date.now();
-    await db.updateRequest(request);
-
-    const { pathIdentifier } = request.data;
-
-    switch (request.type) {
-      case 'START_RECORDING': {
-        const response = await authenticatedFetch(endpoints.start(recordingServiceUrl, pathIdentifier), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' }
-        });
-        if (!response.ok) throw new Error(`Start recording request failed: ${response.status}`);
-        break;
-      }
-      case 'COMPLETE_RECORDING': {
-        const response = await authenticatedFetch(endpoints.complete(recordingServiceUrl, pathIdentifier), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' }
-        });
-        if (!response.ok) throw new Error(`Complete recording request failed: ${response.status}`);
-        request.data.result = await response.json();
-        break;
-      }
-      case 'PREPARE':
-      case 'GET_SALT':
-        // Never queued for the worker — mark completed to unblock dependents.
-        break;
-      default:
-        throw new Error(`Unsupported request type: ${request.type}`);
-    }
-
-    request.status = 'COMPLETED';
-    request.updatedAt = Date.now();
-    await db.updateRequest(request);
   }
 
   // ---- Retry orchestration -----------------------------------------------------------
@@ -284,12 +207,13 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
 
   /**
    * One pass over every PENDING chunk, then every PENDING request. Chunk uploads are driven
-   * here (processChunk also marks their PRESIGNED_URL/UPLOAD_CHUNK requests COMPLETED), so the
+   * here (processRecordingChunk also marks their PRESIGNED_URL/UPLOAD_CHUNK requests COMPLETED), so the
    * request loop skips those types rather than mis-handling them as "unsupported".
    * Returns how many ops it advanced and how many remain PENDING.
    */
   async function drainOnce(): Promise<{ progressed: number; remaining: number }> {
     let progressed = 0;
+    const ctx = buildContext();
 
     for (const chunk of await db.getChunksByStatus('PENDING')) {
       if (!isOnline()) break;
@@ -298,7 +222,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
       fresh.status = 'IN_PROGRESS';
       await db.updateChunk(fresh);
       try {
-        await processChunk(fresh);
+        await processChunk(ctx, fresh);
         progressed++;
         await notifyClients({
           type: 'CHUNK_UPLOADED',
@@ -312,26 +236,26 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
           reload.status = reload.attempts >= maxChunkAttempts ? 'FAILED' : 'PENDING';
           await db.updateChunk(reload);
           if (reload.status === 'FAILED') {
-            await markChunkRequestsFailed(reload, String((error as any)?.message ?? error));
+            await markChunkRequestsFailed(ctx, reload, String((error as any)?.message ?? error));
           }
         }
       }
     }
 
     const requests = (await db.getRequestsByStatus('PENDING')).sort((a, b) => {
-      const pa = a.priority ?? getRequestPriority(a.type);
-      const pb = b.priority ?? getRequestPriority(b.type);
+      const pa = a.priority ?? priorityFor(operations, a.type);
+      const pb = b.priority ?? priorityFor(operations, b.type);
       return pa !== pb ? pa - pb : a.createdAt - b.createdAt;
     });
     for (const request of requests) {
       if (!isOnline()) break;
       // PRESIGNED_URL/UPLOAD_CHUNK are chunk-driven (see the chunk loop above).
-      if (request.type === 'PRESIGNED_URL' || request.type === 'UPLOAD_CHUNK') continue;
+      if (isChunkDriven(operations, request.type)) continue;
       const fresh = await db.getRequest(request.id);
       if (!fresh || fresh.status !== 'PENDING') continue;
       if (!(await checkDependencies(fresh))) continue;
       try {
-        await processRequest(fresh);
+        await processRecordingRequest(ctx, fresh, operations);
         progressed++;
         await notifyClients({ type: 'REQUEST_COMPLETED', requestId: request.id, requestType: request.type });
         // Once the recording is completed on the server, purge its now-redundant queue data

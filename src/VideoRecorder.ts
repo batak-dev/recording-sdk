@@ -69,8 +69,16 @@ export class VideoRecorder {
     this.forceProbe = options.forceProbe ?? false;
     this.networkMonitorInterval = options.networkMonitorInterval ?? 3000;
 
+    // Resolve the codec from the built-in presets plus any consumer-provided codecs.
+    const codecs = { ...CODEC_PRESETS, ...options.codecs };
     const codecKey = options.codecKey ?? 'av1_opus';
-    this.codec = CODEC_PRESETS[codecKey];
+    const codec = codecs[codecKey];
+    if (!codec) {
+      throw new Error(
+        `Unknown codecKey "${codecKey}". Available: ${Object.keys(codecs).join(', ')}`
+      );
+    }
+    this.codec = codec;
 
     // Quality strategy: maps throughput->quality and quality->preset. Injectable so a
     // consumer can redefine "network quality" (custom thresholds and/or presets).

@@ -10,6 +10,11 @@ provider).
 
 > Requires a Chromium-based browser (WebCodecs, `MediaStreamTrackProcessor`, `OffscreenCanvas`).
 
+> **Configurable backend (Prisma/Drizzle-style):** the SDK is a backend-agnostic engine; your
+> transport/operations/stores are defined in your app via `defineRecordingConfig`. See
+> [`docs/usage.md`](docs/usage.md), the [`examples/`](examples/), and the design in
+> [`docs/architecture.md`](docs/architecture.md). Frontend cut: [`docs/migration-frontend.md`](docs/migration-frontend.md).
+
 ## Install
 
 ```bash
@@ -26,8 +31,9 @@ This package is published to GitHub Packages. Add to your `.npmrc`:
 
 | Import | Contents |
 | --- | --- |
-| `@batak-dev/recording-sdk` | `VideoRecorder`, codec presets, crypto, signed-chunk format, network/quality, interfaces |
-| `@batak-dev/recording-sdk/queue` | `OfflineQueueManager`, recording request handlers, enqueue helpers |
+| `@batak-dev/recording-sdk` | `VideoRecorder`, `defineRecordingConfig`, codec presets, crypto, signed-chunk format, network/quality, interfaces |
+| `@batak-dev/recording-sdk/presets` | `recordingServicePreset`, `RecordingServiceTransport`, API DTOs (the default backend, separable) |
+| `@batak-dev/recording-sdk/queue` | `OfflineQueueManager`, operation registry/contracts, recording request handlers, enqueue helpers |
 | `@batak-dev/recording-sdk/storage` | IndexedDB persistence + blob store (the shared schema) |
 | `@batak-dev/recording-sdk/network` | `NetworkMonitor`, quality presets |
 | `@batak-dev/recording-sdk/resilience` | `ResilienceCollector`, metrics |

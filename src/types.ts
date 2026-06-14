@@ -27,7 +27,11 @@ export interface RecordingChunk {
 }
 
 export interface RecorderOptions {
-  codecKey?: 'vp8_opus' | 'vp9_opus' | 'av1_opus';
+  /** Key into the codec preset map. Built-in keys: 'vp8_opus' | 'vp9_opus' | 'av1_opus'.
+   *  Open-ended so a consumer can select one of their own `codecs` entries. */
+  codecKey?: string;
+  /** Extra/override codec presets, merged over the built-ins (consumer-defined codecs). */
+  codecs?: Record<string, RecorderCodecConfig>;
   videoConfig?: Partial<VideoConfig>;
   audioConfig?: Partial<AudioConfig>;
   chunkDurationMs?: number;

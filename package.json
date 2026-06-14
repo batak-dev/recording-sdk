@@ -11,8 +11,12 @@
   },
   "files": [
     "dist",
+    "bin",
     "README.md"
   ],
+  "bin": {
+    "recording-sdk": "bin/recording-sdk.mjs"
+  },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com",
     "access": "restricted"
@@ -48,6 +52,10 @@
     "./auth": {
       "types": "./dist/auth.d.ts",
       "import": "./dist/auth.js"
+    },
+    "./presets": {
+      "types": "./dist/presets.d.ts",
+      "import": "./dist/presets.js"
     },
     "./sw": {
       "types": "./dist/sw.d.ts",

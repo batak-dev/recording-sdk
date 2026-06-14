@@ -9,7 +9,8 @@ export default defineConfig({
     resilience: 'src/resilience.ts',
     transport: 'src/transport.ts',
     auth: 'src/auth.ts',
-    sw: 'src/sw.ts'
+    sw: 'src/sw.ts',
+    presets: 'src/presets.ts'
   },
   format: ['esm'],
   dts: true,

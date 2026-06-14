@@ -1,11 +1,16 @@
-// Request types for queue operations
-export type RequestType =
+// Request types for queue operations.
+// The built-in recording-service operation names; kept as a union for autocomplete.
+export type KnownRequestType =
   | 'PREPARE'
   | 'GET_SALT'
   | 'START_RECORDING'
   | 'PRESIGNED_URL'
   | 'UPLOAD_CHUNK'
   | 'COMPLETE_RECORDING';
+
+// Open-ended: consumers can register custom operation names in their operation registry.
+// `string & {}` keeps the literal-union hints for the known names while allowing any string.
+export type RequestType = KnownRequestType | (string & {});
 
 // Priority levels for queue processing
 export enum Priority {
@@ -18,11 +23,12 @@ export enum Priority {
 // Request status
 export type RequestStatus = 'PENDING' | 'IN_PROGRESS' | 'FAILED' | 'COMPLETED' | 'EXPIRED' | 'NEEDS_AUTH';
 
-// Base request structure
-export interface QueuedRequest {
+// Base request structure. `Data` is the operation's payload type (see the operation
+// registry); it defaults to `any` so existing untyped call sites keep compiling.
+export interface QueuedRequest<Data = any> {
   id: string;
   type: RequestType;
-  data: any;
+  data: Data;
   status: RequestStatus;
   attempts: number;
   maxAttempts: number;

@@ -17,6 +17,11 @@ export { AudioVisualizer } from './audioVisualizer';
 export { isRecorderApiSupported, CODEC_PRESETS } from './config';
 export * from './types';
 
+// Config facade — assembles schema/codecs/operations/endpoints/timings/auth into one
+// resolved object shared by the page and the service-worker entry.
+export { defineRecordingConfig } from './recordingConfig';
+export type { RecordingConfig, ResolvedRecordingConfig } from './recordingConfig';
+
 // Adaptive quality / network
 export { NetworkMonitor } from './networkMonitor';
 export type { NetworkQuality, NetworkStats, NetworkMonitorOptions, INetworkMonitor } from './networkMonitor';

@@ -13,6 +13,8 @@ import { Priority } from './types';
 import * as db from './db';
 import { EventEmitter } from '../eventEmitter';
 import type { IAuthTokenProvider } from '../auth/types';
+import { priorityFor, type OperationRegistry } from './operations';
+import { recordingOperationRegistry } from './recordingOperations';
 
 const MAX_CONCURRENT_OPERATIONS = 2;
 const MAX_RETRY_ATTEMPTS = 5;
@@ -30,6 +32,12 @@ export interface QueueManagerOptions {
    * still retries `NEEDS_AUTH` requests and assumes the session is valid.
    */
   authProvider?: IAuthTokenProvider;
+  /**
+   * Operation registry used for request priority. Defaults to the built-in
+   * recording-service operations. A consumer with custom operations passes their registry
+   * here so enqueue priorities match.
+   */
+  operations?: OperationRegistry;
 }
 
 export class OfflineQueueManager extends EventEmitter {
@@ -110,21 +118,11 @@ export class OfflineQueueManager extends EventEmitter {
   }
 
   /**
-   * Get priority for request type
+   * Get priority for request type, from the operation registry.
    * Note: PREPARE and GET_SALT are NOT queued - they run synchronously during setup
    */
   private getPriority(type: RequestType): Priority {
-    switch (type) {
-      case 'START_RECORDING':
-        return Priority.CRITICAL;
-      case 'PRESIGNED_URL':
-      case 'UPLOAD_CHUNK':
-        return Priority.HIGH;
-      case 'COMPLETE_RECORDING':
-        return Priority.LOW;
-      default:
-        return Priority.MEDIUM;
-    }
+    return priorityFor(this.options.operations ?? recordingOperationRegistry, type);
   }
 
   /**
