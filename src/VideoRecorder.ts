@@ -148,14 +148,28 @@ export class VideoRecorder {
     this.forceRotate = true;
   }
 
+  /**
+   * Pre-initialize the MediaPipe segmenter (downloads WASM + tflite model, GPU init)
+   * ahead of start(), so the 2-4s of heavy work can overlap a countdown/spinner
+   * instead of freezing the UI when recording begins. Safe to call before start()
+   * and idempotent — a no-op once a segmenter is already prepared.
+   */
+  async prepare(): Promise<void> {
+    if (!this.segmenter) {
+      this.segmenter = await initializeSegmenter();
+    }
+  }
+
   async start(): Promise<MediaStream> {
     if (this.isRecording) {
       throw new Error('Recording already in progress');
     }
 
     try {
-      // 1. Initialize MediaPipe Segmenter
-      this.segmenter = await initializeSegmenter();
+      // 1. Initialize MediaPipe Segmenter (reuse one prepared via prepare(), if any)
+      if (!this.segmenter) {
+        this.segmenter = await initializeSegmenter();
+      }
 
       // 2. Access Camera
       this.stream = await navigator.mediaDevices.getUserMedia({
