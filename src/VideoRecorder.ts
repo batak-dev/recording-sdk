@@ -445,14 +445,11 @@ export class VideoRecorder {
     console.log(`Adjusting quality from ${this.currentQuality} to ${newQuality}`);
     this.currentQuality = newQuality;
     
-    // If offline, just notify but don't reconfigure encoders
-    if (newQuality === 'offline') {
-      if (this.onQualityChange) {
-        this.onQualityChange('Offline - Continue Recording', 0);
-      }
-      return;
-    }
-    
+    // Apply the new preset to the encoders. The 'offline' level resolves to the
+    // same encoder + background settings as 'poor' (see QUALITY_PRESETS), so going
+    // offline drops the encoder to the lowest bitrate. This keeps the chunks that
+    // are queued while disconnected as small as possible instead of retaining the
+    // previous (possibly high) online bitrate.
     this.currentQualityPreset = this.qualityStrategy.getPreset(newQuality);
 
     // Reconfigure encoders with new bitrates
@@ -464,17 +461,21 @@ export class VideoRecorder {
         this.qualityJustChanged = true;
         console.log(`Quality changed, keyframe will be inserted on next frame`);
       }
-      
+
       if (this.audioEncoder && this.audioEncoder.state === 'configured') {
         this.configureAudioEncoder();
       }
-      
+
       // Notify callback
       if (this.onQualityChange) {
-        this.onQualityChange(
-          this.currentQualityPreset.name, 
-          this.currentQualityPreset.videoBitrate
-        );
+        if (newQuality === 'offline') {
+          this.onQualityChange('Offline - Continue Recording', 0);
+        } else {
+          this.onQualityChange(
+            this.currentQualityPreset.name,
+            this.currentQualityPreset.videoBitrate
+          );
+        }
       }
     } catch (error) {
       console.error('Error adjusting quality:', error);
