@@ -69,18 +69,26 @@ export async function triggerBackgroundSync(): Promise<boolean> {
   return postToWorker({ type: 'TRIGGER_SYNC' });
 }
 
-function postToWorker(message: any): Promise<boolean> {
-  return new Promise((resolve) => {
-    const controller =
-      typeof navigator !== 'undefined' && navigator.serviceWorker
-        ? navigator.serviceWorker.controller
-        : null;
-    if (!controller) {
-      resolve(false);
-      return;
+async function postToWorker(message: any): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !navigator.serviceWorker) return false;
+  // Prefer the controller, but fall back to the registration's active worker. `controller` is
+  // null when this page isn't yet controlled — right after a SW update, or on a reload before
+  // claim — in which case posting via the controller would silently drop the message (so a
+  // TRIGGER_SYNC to drain the queue would never reach the worker). The active worker receives
+  // the message either way.
+  let target: ServiceWorker | null = navigator.serviceWorker.controller;
+  if (!target) {
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      target = reg?.active ?? null;
+    } catch {
+      target = null;
     }
+  }
+  if (!target) return false;
+  return new Promise((resolve) => {
     const channel = new MessageChannel();
     channel.port1.onmessage = (event) => resolve(!!event.data?.success);
-    controller.postMessage(message, [channel.port2]);
+    target!.postMessage(message, [channel.port2]);
   });
 }
