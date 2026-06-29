@@ -179,15 +179,42 @@ export class OfflineQueueManager extends EventEmitter {
 
     console.log('Queue processing started');
 
+    // Tell the Service Worker we're actively draining so it defers to us (avoids double-
+    // processing). Heartbeating — not a one-shot — so that if this page goes idle or dies, the
+    // worker stops hearing it and takes over the leftover queue itself.
+    this.notifyServiceWorkerDraining();
+
     // Process queue periodically
     this.processingLoop = window.setInterval(async () => {
-      if (this.isOnline && this.activeOperations < MAX_CONCURRENT_OPERATIONS) {
-        await this.processNextRequest();
+      if (this.isOnline) {
+        this.notifyServiceWorkerDraining();
+        if (this.activeOperations < MAX_CONCURRENT_OPERATIONS) {
+          await this.processNextRequest();
+        }
       }
     }, 1000);
 
     // Also process immediately
     await this.processNextRequest();
+  }
+
+  /**
+   * Heartbeat to the active Service Worker that this page is draining the queue, so it defers
+   * rather than processing in parallel. Best-effort: no SW (or no controller yet) is a no-op.
+   */
+  private notifyServiceWorkerDraining() {
+    try {
+      const sw = navigator.serviceWorker;
+      if (!sw) return;
+      if (sw.controller) {
+        sw.controller.postMessage({ type: 'CLIENT_DRAINING' });
+      } else {
+        // Not yet controlled (first load before claim) — post to the active worker directly.
+        sw.ready.then((reg) => reg.active?.postMessage({ type: 'CLIENT_DRAINING' })).catch(() => {});
+      }
+    } catch {
+      // ignore — heartbeat is advisory
+    }
   }
 
   /**

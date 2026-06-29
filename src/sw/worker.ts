@@ -50,6 +50,8 @@ export interface RecordingWorkerOptions {
   autoRetryIntervalMs?: number;
   /** Minimum gap between fetch-triggered pending checks (default 30000ms). */
   networkCheckIntervalMs?: number;
+  /** How recently a page must have heartbeated for the worker to defer to it (default 8000ms). */
+  clientHeartbeatTtlMs?: number;
   /** Content-Type used for the object-store PUT upload (default 'video/webm'). */
   uploadContentType?: string;
   /** How long a freshly fetched presigned URL is considered valid (default 10min). */
@@ -81,6 +83,12 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
   const maxChunkAttempts = options.maxChunkAttempts ?? 5;
   const autoRetryIntervalMs = options.autoRetryIntervalMs ?? 10000;
   const networkCheckIntervalMs = options.networkCheckIntervalMs ?? 30000;
+  // Only defer to an open page if it heartbeated within this window (it sends one each
+  // processing tick while actively draining). An open-but-idle page — e.g. the setup screen
+  // after a reload, with no active queue manager — stops heartbeating, so the worker takes
+  // over instead of deferring forever and leaving the queue stalled until the next session.
+  const clientHeartbeatTtlMs = options.clientHeartbeatTtlMs ?? 8000;
+  let lastClientHeartbeat = 0;
   const uploadContentType = options.uploadContentType ?? 'video/webm';
   const presignedTtlMs = options.presignedTtlMs ?? 10 * 60 * 1000;
 
@@ -379,9 +387,13 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
       // but re-arm a background sync so the worker still takes over once the page closes.
       // includeUncontrolled: a freshly-loaded page runs its OfflineQueueManager even before
       // the worker claims it, so treat any open window of this origin as "the page has it".
+      // Defer only to a page that is *actively* draining (heartbeating). An open-but-idle page
+      // (no active queue manager — e.g. the setup screen after a reload) doesn't heartbeat, so we
+      // must NOT defer to it, or its leftover queue would never drain until the next session.
       const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
-      if (clients.length > 0) {
-        await notifyClients({ type: 'SW_READY', message: 'Service Worker deferring to open client' });
+      const clientDraining = Date.now() - lastClientHeartbeat < clientHeartbeatTtlMs;
+      if (clients.length > 0 && clientDraining) {
+        await notifyClients({ type: 'SW_READY', message: 'Service Worker deferring to active client' });
         await armBackgroundSync();
         return -1;
       }
@@ -494,6 +506,9 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
     if (data.type === 'SET_CONFIG') {
       if (data.recordingServiceUrl) recordingServiceUrl = data.recordingServiceUrl;
       event.ports?.[0]?.postMessage({ success: true });
+    } else if (data.type === 'CLIENT_DRAINING') {
+      // A page's OfflineQueueManager is actively draining; defer to it (see runRetryQueue).
+      lastClientHeartbeat = Date.now();
     } else if (data.type === 'TRIGGER_SYNC') {
       runRetryQueue()
         .then((remaining) => {
