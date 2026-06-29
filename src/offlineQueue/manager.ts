@@ -38,6 +38,7 @@ export class OfflineQueueManager extends EventEmitter {
   private activeOperations = 0;
   private options: QueueManagerOptions;
   private processingLoop: number | null = null;
+  private recovered = false; // orphaned-IN_PROGRESS reclaim runs once per manager
 
   constructor(options: QueueManagerOptions = {}) {
     super();
@@ -162,6 +163,20 @@ export class OfflineQueueManager extends EventEmitter {
     if (this.isProcessing) return;
 
     this.isProcessing = true;
+
+    // One-time crash recovery: reclaim work orphaned at IN_PROGRESS by a previous page/worker
+    // that died mid-upload. Must run before the loop sets its own IN_PROGRESS locks, and only
+    // once per manager (setting isProcessing above locks out re-entry during the await).
+    if (!this.recovered) {
+      this.recovered = true;
+      try {
+        const reclaimed = await db.resetStuckProcessing();
+        if (reclaimed > 0) console.log(`[QueueManager] Reclaimed ${reclaimed} orphaned in-progress operation(s)`);
+      } catch (err) {
+        console.warn('[QueueManager] Failed to reclaim orphaned operations:', err);
+      }
+    }
+
     console.log('Queue processing started');
 
     // Process queue periodically

@@ -386,6 +386,16 @@ export function createRecordingWorker(options: RecordingWorkerOptions = {}): voi
         return -1;
       }
 
+      // No page is driving the queue, so any IN_PROGRESS item is orphaned (a terminated worker or
+      // a closed page that died mid-upload). Reclaim them to PENDING before draining — otherwise
+      // they're never retried and a dependent COMPLETE_RECORDING stays blocked forever.
+      try {
+        const reclaimed = await db.resetStuckProcessing();
+        if (reclaimed > 0) console.log(`[SW] Reclaimed ${reclaimed} orphaned in-progress operation(s)`);
+      } catch (error) {
+        console.error('[SW] Failed to reclaim orphaned operations:', error);
+      }
+
       let totalProgressed = 0;
       let remaining = 0;
       const maxPasses = 8;

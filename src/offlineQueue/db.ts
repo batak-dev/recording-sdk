@@ -242,6 +242,33 @@ export async function getAllChunks(): Promise<StoredChunk[]> {
   });
 }
 
+/**
+ * Reclaim orphaned in-flight work: requests/chunks left at IN_PROGRESS by a drainer (the page's
+ * OfflineQueueManager or the Service Worker) that died mid-operation — a tab refresh/close or a
+ * terminated worker. IN_PROGRESS is an in-memory lock; the next drainer only ever picks up
+ * PENDING items, so without this an orphan is never retried and any COMPLETE_RECORDING that
+ * depends on it blocks forever.
+ *
+ * Safe to call at a drainer's startup because the page and the SW are mutually exclusive (the SW
+ * defers to any open window), so nothing else is legitimately mid-flight at that moment. Returns
+ * the number of items reclaimed.
+ */
+export async function resetStuckProcessing(): Promise<number> {
+  let count = 0;
+  for (const req of await getRequestsByStatus('IN_PROGRESS')) {
+    req.status = 'PENDING';
+    req.updatedAt = Date.now();
+    await updateRequest(req);
+    count++;
+  }
+  for (const chunk of await getChunksByStatus('IN_PROGRESS')) {
+    chunk.status = 'PENDING';
+    await updateChunk(chunk);
+    count++;
+  }
+  return count;
+}
+
 // ==================== Metadata Operations ====================
 
 export async function saveMetadata(metadata: RecordingMetadata): Promise<void> {
