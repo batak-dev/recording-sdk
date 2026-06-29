@@ -10,6 +10,7 @@ import type {
   ResilienceEvent,
   ResilienceSummary,
   ChunkStatsInput,
+  ChunkStatusSnapshot,
   QualityChangeEvent
 } from './types';
 
@@ -112,6 +113,26 @@ export function retrySuccessRate(events: ResilienceEvent[]): number | null {
     if (completedIds.has(id)) succeeded++;
   });
   return succeeded / retriedIds.size;
+}
+
+/**
+ * B5 — queue-state consistency: fraction of chunks whose local COMPLETED status agrees with
+ * MinIO presence (`presentIndices`). Pure so it can run from a persisted snapshot post-hoc.
+ * Returns null when either input is missing/empty.
+ */
+export function computeConsistencyRate(
+  chunkStatuses: ChunkStatusSnapshot[] | undefined,
+  presentIndices: number[] | undefined
+): number | null {
+  if (!chunkStatuses?.length || !presentIndices) return null;
+  const present = new Set(presentIndices);
+  let matches = 0;
+  for (const c of chunkStatuses) {
+    const inMinio = present.has(c.chunkIndex);
+    const localCompleted = c.status === 'COMPLETED';
+    if (inMinio === localCompleted) matches++;
+  }
+  return matches / chunkStatuses.length;
 }
 
 const clamp01 = (n: number) => Math.max(0, Math.min(1, n));

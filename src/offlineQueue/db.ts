@@ -10,7 +10,7 @@ import type {
   PresignedUrlCache,
   AuthTokenCache
 } from './types';
-import type { ResilienceEvent, ResilienceSessionMeta } from '../resilience/types';
+import type { ResilienceEvent, ResilienceSessionMeta, ChunkStatusSnapshot } from '../resilience/types';
 import {
   DEFAULT_SCHEMA,
   applySchema,
@@ -40,6 +40,11 @@ export interface ResilienceLogRecord {
   meta: ResilienceSessionMeta;
   events: ResilienceEvent[];
   updatedAt: number;
+  /**
+   * Per-chunk local upload statuses captured by clearRecordingData() right before the chunk
+   * records are purged. Lets B5 consistency be recomputed when the log is downloaded later.
+   */
+  chunkStatuses?: ChunkStatusSnapshot[];
 }
 
 /**
@@ -399,6 +404,22 @@ export async function clearRecordingData(
 
   // Chunks + their blobs + presigned-cache entries.
   const chunks = await getChunksByPath(pathIdentifier);
+
+  // Snapshot the per-chunk local statuses into the resilience log before they're deleted, so
+  // B5 queue-state consistency can still be computed when the log is downloaded post-hoc.
+  if (keepResilienceLog && chunks.length > 0) {
+    try {
+      const log = await getResilienceLog(pathIdentifier);
+      if (log) {
+        log.chunkStatuses = chunks.map((c) => ({ chunkIndex: c.chunkIndex, status: c.status }));
+        log.updatedAt = Date.now();
+        await saveResilienceLog(log);
+      }
+    } catch {
+      // Best-effort: a snapshot failure must not block cleanup.
+    }
+  }
+
   const blobIds = chunks.map((c) => c.blobId).filter(Boolean) as string[];
   if (blobIds.length > 0) {
     const db = await getDB();

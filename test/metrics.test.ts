@@ -7,6 +7,7 @@ import {
   recoveryTimes,
   retrySuccessRate,
   computeSummary,
+  computeConsistencyRate,
   RRS_WEIGHTS
 } from '../src/resilience/metrics';
 import type { ResilienceEvent } from '../src/resilience/types';
@@ -92,6 +93,32 @@ describe('retrySuccessRate', () => {
     ];
     // a retried+completed, b failed+never completed => 1/2
     expect(retrySuccessRate(events)).toBe(0.5);
+  });
+});
+
+describe('computeConsistencyRate', () => {
+  it('is null without a snapshot or present indices', () => {
+    expect(computeConsistencyRate(undefined, [0, 1])).toBeNull();
+    expect(computeConsistencyRate([], [0, 1])).toBeNull();
+    expect(computeConsistencyRate([{ chunkIndex: 0, status: 'COMPLETED' }], undefined)).toBeNull();
+  });
+
+  it('is 1 when local COMPLETED status agrees with MinIO presence', () => {
+    const snapshot = [
+      { chunkIndex: 0, status: 'COMPLETED' },
+      { chunkIndex: 1, status: 'COMPLETED' }
+    ];
+    expect(computeConsistencyRate(snapshot, [0, 1])).toBe(1);
+  });
+
+  it('counts agreement on both presence and absence', () => {
+    const snapshot = [
+      { chunkIndex: 0, status: 'COMPLETED' }, // present  -> agree
+      { chunkIndex: 1, status: 'PENDING' },   // absent   -> agree
+      { chunkIndex: 2, status: 'COMPLETED' }  // absent   -> disagree
+    ];
+    // present indices: only 0 made it to MinIO
+    expect(computeConsistencyRate(snapshot, [0])).toBeCloseTo(2 / 3);
   });
 });
 

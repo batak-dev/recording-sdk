@@ -10,7 +10,7 @@ import type { NetworkStats, NetworkQuality } from '../networkMonitor';
 import { getQualityPreset } from '../qualityLevels';
 import type { OfflineQueueManager } from '../offlineQueue';
 import * as db from '../offlineQueue/db';
-import { computeSummary } from './metrics';
+import { computeSummary, computeConsistencyRate } from './metrics';
 import type {
   ResilienceEvent,
   ResilienceReport,
@@ -192,15 +192,10 @@ export class ResilienceCollector {
     if (!chunkStats?.presentIndices) return null;
     try {
       const chunks = await db.getChunksByPath(this.meta.pathIdentifier);
-      if (chunks.length === 0) return null;
-      const present = new Set(chunkStats.presentIndices);
-      let matches = 0;
-      for (const c of chunks) {
-        const inMinio = present.has(c.chunkIndex);
-        const localCompleted = c.status === 'COMPLETED';
-        if (inMinio === localCompleted) matches++;
-      }
-      return matches / chunks.length;
+      return computeConsistencyRate(
+        chunks.map((c) => ({ chunkIndex: c.chunkIndex, status: c.status })),
+        chunkStats.presentIndices
+      );
     } catch {
       return null;
     }
@@ -244,16 +239,43 @@ export class ResilienceCollector {
   }
 }
 
-/** Recover a persisted (possibly crashed) session's report from IndexedDB. */
-export async function loadPersistedReport(pathIdentifier: string): Promise<ResilienceReport | null> {
+/**
+ * Recover a persisted (possibly crashed) session's report from IndexedDB.
+ *
+ * Pass `chunkStats` (from the recording-service) to populate the chunkStats-derived metrics —
+ * CDR, duplicate rate, and B5 consistency (computed from the chunk-status snapshot the log
+ * carries once the recording completed) — and hence RRS. Without it those stay null.
+ */
+export async function loadPersistedReport(
+  pathIdentifier: string,
+  chunkStats?: ChunkStatsInput
+): Promise<ResilienceReport | null> {
   const log = await db.getResilienceLog(pathIdentifier);
   if (!log) return null;
   const durationMs = (log.updatedAt ?? Date.now()) - log.meta.startedAt;
-  const summary = computeSummary(log.events, durationMs);
+
+  // Prefer the snapshot taken at completion; fall back to live chunk records when they haven't
+  // been purged yet (an incomplete/interrupted recording — the most interesting B5 case).
+  let chunkStatuses = log.chunkStatuses;
+  if (!chunkStatuses) {
+    try {
+      const liveChunks = await db.getChunksByPath(pathIdentifier);
+      if (liveChunks.length > 0) {
+        chunkStatuses = liveChunks.map((c) => ({ chunkIndex: c.chunkIndex, status: c.status }));
+      }
+    } catch {
+      // ignore — consistency just stays null
+    }
+  }
+
+  const consistency = computeConsistencyRate(chunkStatuses, chunkStats?.presentIndices);
+  const summary = computeSummary(log.events, durationMs, chunkStats, consistency);
   return {
     meta: log.meta,
     summary,
     events: log.events,
+    chunkStats,
+    chunkStatuses,
     generatedAt: Date.now()
   };
 }

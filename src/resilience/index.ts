@@ -7,6 +7,7 @@ export { ResilienceCollector, loadPersistedReport, listPersistedLogs } from './R
 export { downloadJSON } from './download';
 export {
   computeSummary,
+  computeConsistencyRate,
   RRS_WEIGHTS,
   MAX_ACCEPTABLE_SWITCH_FREQUENCY,
   MAX_ACCEPTABLE_RECOVERY_S

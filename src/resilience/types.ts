@@ -120,6 +120,17 @@ export interface ChunkStatsInput {
   presentIndices?: number[];
 }
 
+/**
+ * Snapshot of each chunk's local upload status, captured just before a completed recording's
+ * transient data is purged. Persisted into the resilience log so B5 queue-state consistency
+ * (local COMPLETED vs MinIO presence) can be recomputed post-hoc — the per-chunk records are
+ * otherwise gone by download time.
+ */
+export interface ChunkStatusSnapshot {
+  chunkIndex: number;
+  status: string; // RequestStatus, kept loose to avoid a queue-layer type dependency
+}
+
 /** Computed metric summary. Fields are `null` when the underlying data is unavailable. */
 export interface ResilienceSummary {
   // Session
@@ -163,5 +174,7 @@ export interface ResilienceReport {
   summary: ResilienceSummary;
   events: ResilienceEvent[];
   chunkStats?: ChunkStatsInput;
+  /** Local chunk statuses snapshotted at completion; source data for B5 consistency. */
+  chunkStatuses?: ChunkStatusSnapshot[];
   generatedAt: number;
 }
