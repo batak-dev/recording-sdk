@@ -174,11 +174,17 @@ export class ResilienceCollector {
   /** Persist the full event log + meta to IndexedDB (crash-safe snapshot). */
   async flush(): Promise<void> {
     try {
+      // Preserve the chunk-status snapshot written by clearRecordingData() at completion. The
+      // collector doesn't own that field, so a plain overwrite here would drop it — and since
+      // flushes fire after completion (queue-drained event, destroy(), page unload), that would
+      // wipe the B5 consistency source data. Carry it forward via read-modify-write.
+      const existing = await db.getResilienceLog(this.meta.pathIdentifier);
       await db.saveResilienceLog({
         pathIdentifier: this.meta.pathIdentifier,
         meta: this.meta,
         events: this.events,
-        updatedAt: Date.now()
+        updatedAt: Date.now(),
+        chunkStatuses: existing?.chunkStatuses
       });
     } catch (err) {
       console.warn('[Resilience] flush failed:', err);
