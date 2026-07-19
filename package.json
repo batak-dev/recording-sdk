@@ -3,7 +3,7 @@
   "version": "0.2.12",
   "description": "Extensible, resilient WebCodecs video-recording SDK: adaptive quality, signed chunked upload, offline queue, service-worker background sync, and resilience telemetry.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": false,
   "sideEffects": false,
   "engines": {
